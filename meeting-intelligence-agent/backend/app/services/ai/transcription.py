@@ -37,6 +37,14 @@ except ImportError:
     PYANNOTE_AVAILABLE = False
     Pipeline = None
 
+# Groq Whisper API (fast cloud transcription)
+try:
+    from groq import Groq as GroqClient  # type: ignore
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    GroqClient = None
+
 
 class TranscriptionSegment(BaseModel):
     """Transcription segment"""
@@ -96,16 +104,16 @@ class TranscriptionService:
         language: Optional[str] = None,
     ) -> TranscriptionResult:
         """
-        Transcribe audio file with optional speaker diarization
-        
-        Args:
-            audio_path: Path to audio file
-            enable_diarization: Whether to perform speaker diarization
-            language: Language code (auto-detect if None)
-        
-        Returns:
-            TranscriptionResult with segments
+        Transcribe audio file with optional speaker diarization.
+        Uses Groq Whisper API first (fast), falls back to local Whisper.
         """
+        # Try Groq Whisper first — much faster than local
+        if GROQ_AVAILABLE and settings.GROQ_API_KEY:
+            try:
+                return await self._transcribe_with_groq(audio_path)
+            except Exception as exc:
+                logger.warning(f"Groq transcription failed, falling back to local Whisper: {exc}")
+
         if not WHISPER_AVAILABLE:
             logger.warning("Whisper unavailable, using fallback transcription")
             fallback_text = self._fallback_text_from_file(audio_path)
@@ -171,7 +179,47 @@ class TranscriptionService:
             language=result["language"],
             duration=result.get("duration", 0),
         )
-    
+
+    async def _transcribe_with_groq(self, audio_path: str) -> TranscriptionResult:
+        """Transcribe using Groq's Whisper API — very fast cloud transcription."""
+        import asyncio
+
+        def _call_groq():
+            client = GroqClient(api_key=settings.GROQ_API_KEY)
+            with open(audio_path, "rb") as f:
+                response = client.audio.transcriptions.create(
+                    file=(Path(audio_path).name, f),
+                    model="whisper-large-v3-turbo",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+            return response
+
+        logger.info(f"Transcribing with Groq Whisper API: {audio_path}")
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(self._executor, _call_groq)
+
+        raw_segments = getattr(response, "segments", None) or []
+        segments = []
+        for seg in raw_segments:
+            segments.append(TranscriptionSegment(
+                start=float(seg.get("start", 0)),
+                end=float(seg.get("end", 0)),
+                text=str(seg.get("text", "")).strip(),
+                speaker=None,
+                confidence=1.0,
+            ))
+
+        if not segments:
+            # Groq returned flat text only
+            full_text = getattr(response, "text", "") or ""
+            segments = [TranscriptionSegment(start=0.0, end=0.0, text=full_text, confidence=1.0)]
+
+        duration = float(segments[-1].end) if segments else 0.0
+        language = getattr(response, "language", "en") or "en"
+        logger.info(f"Groq transcription completed: {len(segments)} segments")
+        return TranscriptionResult(segments=segments, language=language, duration=duration)
+
     def _transcribe_sync(
         self,
         audio_path: str,

@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
+    # Groq (fast inference)
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+
     # Grok (xAI)
     GROK_API_KEY: str = ""
     GROK_BASE_URL: str = "https://api.x.ai/v1"

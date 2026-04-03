@@ -561,6 +561,7 @@ export default function Integrations() {
   )
 
   const zoomConnected = integrations.find(i => i.id === 'zoom')?.connected
+  const googleConnected = integrations.find(i => i.id === 'google')?.connected
 
   const { data: zoomMeetings = [] } = useQuery(
     'zoom-meetings',
@@ -568,6 +569,18 @@ export default function Integrations() {
       id: string; topic: string; start_time: string; duration: number; join_url: string
     }[]),
     { enabled: !!zoomConnected },
+  )
+
+  const { data: googleMeetEvents = [], refetch: refetchGoogleMeet } = useQuery(
+    'google-meet-upcoming',
+    () => api.get('/api/v1/integrations/google/meet/upcoming', { params: { days_ahead: 30 } }).then(r => r.data as {
+      events: Array<{
+        id: string; summary: string; start: { dateTime?: string; date?: string };
+        end: { dateTime?: string; date?: string }; _meet_url: string;
+        attendees?: Array<{ email: string; displayName?: string }>
+      }>; count: number
+    }),
+    { enabled: !!googleConnected, select: d => d.events },
   )
 
   const disconnectMutation = useMutation(
@@ -609,6 +622,9 @@ export default function Integrations() {
 
       if (id === 'zoom') {
         qc.invalidateQueries('zoom-meetings')
+      }
+      if (id === 'google') {
+        qc.invalidateQueries('google-meet-upcoming')
       }
       qc.invalidateQueries('meetings')
     } catch (e: any) {
@@ -988,6 +1004,46 @@ export default function Integrations() {
                       </a>
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+
+            {/* Google Meet upcoming events panel */}
+            {googleConnected && googleMeetEvents.length > 0 && (
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Upcoming Google Meet Events</h2>
+                  <button
+                    onClick={() => refetchGoogleMeet()}
+                    className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-lg hover:bg-green-100 font-medium"
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <div className="bg-white rounded-xl border divide-y">
+                  {googleMeetEvents.map(ev => {
+                    const startRaw = ev.start?.dateTime || ev.start?.date || ''
+                    const startDate = startRaw ? new Date(startRaw).toLocaleString() : '—'
+                    const attendeeCount = ev.attendees?.length ?? 0
+                    return (
+                      <div key={ev.id} className="flex items-center justify-between px-5 py-3">
+                        <div>
+                          <p className="text-sm font-medium text-gray-900">{ev.summary || 'Google Meet'}</p>
+                          <p className="text-xs text-gray-500">
+                            {startDate}{attendeeCount > 0 ? ` · ${attendeeCount} attendee${attendeeCount !== 1 ? 's' : ''}` : ''}
+                          </p>
+                        </div>
+                        <a
+                          href={ev._meet_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-lg hover:bg-green-100 font-medium"
+                        >
+                          Join Meet
+                        </a>
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )}

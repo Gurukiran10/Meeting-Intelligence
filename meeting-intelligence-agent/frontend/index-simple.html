@@ -34,8 +34,8 @@
                     <li class="flex items-center"><span class="text-green-400 mr-2">✓</span> Analytics Dashboard</li>
                     <li class="flex items-center"><span class="text-green-400 mr-2">✓</span> All 8 Endpoints (100% passing)</li>
                 </ul>
-                <a href="http://localhost:8000/docs" target="_blank" class="btn-primary inline-block mb-3">View API Docs</a>
-                <p class="text-xs text-gray-500">Port: 8000 | Framework: FastAPI | Database: SQLite</p>
+                <a href="http://localhost:8001/docs" target="_blank" class="btn-primary inline-block mb-3">View API Docs</a>
+                <p class="text-xs text-gray-500">Port: 8001 | Framework: FastAPI | Database: SQLite</p>
             </div>
 
             <!-- Frontend Status & Setup -->
@@ -67,7 +67,7 @@
             <div class="space-y-4">
                 <div class="bg-gray-900 rounded p-4">
                     <p class="text-sm font-semibold text-blue-400 mb-2">Login</p>
-                    <code class="text-xs text-gray-300 block mb-2">curl -X POST http://localhost:8000/api/v1/auth/login \
+                    <code class="text-xs text-gray-300 block mb-2">curl -X POST http://localhost:8001/api/v1/auth/login \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   --data 'username=admin&password=admin123'</code>
                     <button onclick="testLogin()" class="btn-primary text-sm">Test Login</button>
@@ -150,7 +150,7 @@
                     <p class="font-semibold text-blue-400">FULLY_OPERATIONAL.md</p>
                     <p class="text-sm text-gray-400 mt-1">Complete operational guide</p>
                 </a>
-                <a href="http://localhost:8000/docs" target="_blank" class="bg-gray-700 hover:bg-gray-600 p-4 rounded transition">
+                <a href="http://localhost:8001/docs" target="_blank" class="bg-gray-700 hover:bg-gray-600 p-4 rounded transition">
                     <p class="font-semibold text-blue-400">API Documentation</p>
                     <p class="text-sm text-gray-400 mt-1">Interactive Swagger UI</p>
                 </a>
@@ -171,7 +171,7 @@
     <script>
         async function testLogin() {
             try {
-                const response = await fetch('http://localhost:8000/api/v1/auth/login', {
+                const response = await fetch('http://localhost:8001/api/v1/auth/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: 'username=admin&password=admin123'

@@ -29,6 +29,9 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
     AsyncAnthropic = None
 
+# Groq uses the same OpenAI-compatible SDK
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+
 
 class MentionDetection(BaseModel):
     """Detected mention"""
@@ -78,10 +81,15 @@ class NLPService:
     def __init__(self):
         self.grok_client = (
             AsyncOpenAI(api_key=settings.GROK_API_KEY, base_url=settings.GROK_BASE_URL)
-            if settings.GROK_API_KEY
+            if (settings.GROK_API_KEY and AsyncOpenAI is not None)
             else None
         )  # type: ignore
         self.anthropic_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY) if (settings.ANTHROPIC_API_KEY and AsyncAnthropic is not None) else None  # type: ignore
+        self.groq_client = (
+            AsyncOpenAI(api_key=settings.GROQ_API_KEY, base_url=GROQ_BASE_URL)
+            if (settings.GROQ_API_KEY and AsyncOpenAI is not None)
+            else None
+        )  # type: ignore
 
     def _safe_list(self, value: Any) -> List[str]:
         if isinstance(value, list):
@@ -314,6 +322,21 @@ class NLPService:
             except Exception as exc:
                 logger.warning(f"Grok generation failed: {exc}")
 
+        if self.groq_client:
+            try:
+                response = await self.groq_client.chat.completions.create(  # type: ignore
+                    model=settings.GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=temperature,
+                )
+                return json.loads(response.choices[0].message.content or "{}")  # type: ignore
+            except Exception as exc:
+                logger.warning(f"Groq generation failed: {exc}")
+
         return {}
     
     async def detect_mentions(
@@ -337,7 +360,7 @@ class NLPService:
 
         heuristic_mentions = self._detect_mentions_with_heuristics(transcript, user_profiles)
 
-        if not self.anthropic_client and not self.grok_client:
+        if not self.anthropic_client and not self.grok_client and not self.groq_client:
             logger.warning("No NLP provider configured, returning heuristic mentions")
             return heuristic_mentions
         
@@ -410,7 +433,7 @@ Return a JSON object with a top-level 'mentions' array.
         """Extract action items from transcript"""
         logger.info("Extracting action items")
 
-        if not self.anthropic_client and not self.grok_client:
+        if not self.anthropic_client and not self.grok_client and not self.groq_client:
             logger.warning("No NLP provider configured, returning fallback action items")
             fallback_items: List[ActionItem] = []
             lines = [line.strip() for line in transcript.splitlines() if line.strip()]
@@ -479,7 +502,7 @@ Return a JSON array of action items.
         """Generate comprehensive meeting summary"""
         logger.info("Generating meeting summary")
 
-        if not self.anthropic_client and not self.grok_client:
+        if not self.anthropic_client and not self.grok_client and not self.groq_client:
             logger.warning("No NLP provider configured, returning fallback summary")
             cleaned_lines = [line.strip() for line in transcript.splitlines() if line.strip()]
             key_points = cleaned_lines[:5] if cleaned_lines else ["Meeting was uploaded and processed in fallback mode."]
@@ -487,7 +510,7 @@ Return a JSON array of action items.
             return MeetingSummary(
                 executive_summary=(
                     f"Meeting '{meeting_title}' processed in local fallback mode. "
-                    "AI summary is limited until ANTHROPIC_API_KEY (or GROK_API_KEY) is configured."
+                    "AI summary is limited until ANTHROPIC_API_KEY, GROK_API_KEY, or GROQ_API_KEY is configured."
                 ),
                 key_points=key_points,
                 decisions=[],
@@ -560,7 +583,7 @@ Return a JSON object.
         text: str,
     ) -> Dict[str, float]:
         """Analyze sentiment of text"""
-        if not self.anthropic_client and not self.grok_client:
+        if not self.anthropic_client and not self.grok_client and not self.groq_client:
             return {"sentiment": "neutral", "score": 0.0, "confidence": 0.0}
 
         prompt = f"""Analyze the sentiment of this text.

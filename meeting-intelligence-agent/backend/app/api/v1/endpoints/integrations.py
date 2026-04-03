@@ -138,15 +138,19 @@ class LiveTranscriptSegmentRequest(BaseModel):
 
 # ─────────────────── Helpers ───────────────────
 
+from sqlalchemy.orm.attributes import flag_modified
+
 def _get_integration(user: User, key: str) -> Dict[str, Any]:
     integrations = user.integrations or {}
     return integrations.get(key, {})
 
 
 def _save_integration(db: Session, user: User, key: str, data: Dict[str, Any]):
-    integrations = dict(user.integrations or {})
+    import copy
+    integrations = copy.deepcopy(user.integrations or {})
     integrations[key] = data
     user.integrations = integrations
+    flag_modified(user, "integrations")
     db.commit()
     db.refresh(user)
 
@@ -1830,7 +1834,12 @@ async def google_oauth_url(
             "client_id": resolved_client_id,
             "response_type": "code",
             "redirect_uri": resolved_redirect_uri,
-            "scope": "https://www.googleapis.com/auth/calendar.readonly openid email profile",
+            "scope": (
+                "https://www.googleapis.com/auth/calendar.readonly "
+                "https://www.googleapis.com/auth/calendar.events.readonly "
+                "https://www.googleapis.com/auth/meetings.space.readonly "
+                "openid email profile"
+            ),
             "access_type": "offline",
             "prompt": "consent",
             "state": state,
@@ -1997,6 +2006,137 @@ async def test_google(
         "summary": data.get("summary") or "Unknown",
         "time_zone": data.get("timeZone"),
     }
+
+
+@router.get("/google/calendars")
+async def list_google_calendars(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all Google Calendars accessible to the authenticated user."""
+    from app.services.integrations.google_meet import google_meet_service
+
+    google = _get_integration(current_user, "google")
+    if not google.get("refresh_token") and not google.get("access_token"):
+        raise HTTPException(status_code=400, detail="Google is not connected via OAuth")
+
+    access_token = await _get_google_access_token(db=db, current_user=current_user)
+    calendars = await google_meet_service.list_calendars(access_token)
+    return {"calendars": calendars}
+
+
+@router.get("/google/meet/spaces")
+async def list_google_meet_spaces(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List Google Meet spaces (requires meetings.space.readonly scope).
+    Re-connect Google OAuth if this returns a 403 to grant the new scope.
+    """
+    from app.services.integrations.google_meet import google_meet_service
+
+    google = _get_integration(current_user, "google")
+    if not google.get("refresh_token") and not google.get("access_token"):
+        raise HTTPException(status_code=400, detail="Google is not connected via OAuth")
+
+    access_token = await _get_google_access_token(db=db, current_user=current_user)
+    spaces = await google_meet_service.list_spaces(access_token)
+    return {"spaces": spaces, "count": len(spaces)}
+
+
+@router.get("/google/meet/spaces/{space_id}/recordings")
+async def list_google_meet_recordings(
+    space_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List recordings for a specific Google Meet space."""
+    from app.services.integrations.google_meet import google_meet_service
+
+    google = _get_integration(current_user, "google")
+    if not google.get("refresh_token") and not google.get("access_token"):
+        raise HTTPException(status_code=400, detail="Google is not connected via OAuth")
+
+    access_token = await _get_google_access_token(db=db, current_user=current_user)
+    space_name = f"spaces/{space_id}"
+    recordings = await google_meet_service.list_recordings(access_token, space_name)
+    return {"space": space_name, "recordings": recordings, "count": len(recordings)}
+
+
+@router.get("/google/meet/spaces/{space_id}/transcripts")
+async def list_google_meet_transcripts(
+    space_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List transcripts for a specific Google Meet space."""
+    from app.services.integrations.google_meet import google_meet_service
+
+    google = _get_integration(current_user, "google")
+    if not google.get("refresh_token") and not google.get("access_token"):
+        raise HTTPException(status_code=400, detail="Google is not connected via OAuth")
+
+    access_token = await _get_google_access_token(db=db, current_user=current_user)
+    space_name = f"spaces/{space_id}"
+    transcripts = await google_meet_service.list_transcripts(access_token, space_name)
+    return {"space": space_name, "transcripts": transcripts, "count": len(transcripts)}
+
+
+@router.get("/google/meet/spaces/{space_id}/transcripts/{transcript_id}/entries")
+async def list_google_meet_transcript_entries(
+    space_id: str,
+    transcript_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List transcript entries (utterances) for a specific transcript."""
+    from app.services.integrations.google_meet import google_meet_service
+
+    google = _get_integration(current_user, "google")
+    if not google.get("refresh_token") and not google.get("access_token"):
+        raise HTTPException(status_code=400, detail="Google is not connected via OAuth")
+
+    access_token = await _get_google_access_token(db=db, current_user=current_user)
+    transcript_name = f"spaces/{space_id}/transcripts/{transcript_id}"
+    entries = await google_meet_service.list_transcript_entries(access_token, transcript_name)
+    return {"transcript": transcript_name, "entries": entries, "count": len(entries)}
+
+
+@router.get("/google/meet/upcoming")
+async def list_upcoming_google_meet_events(
+    days_ahead: int = 30,
+    calendar_id: str = "primary",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List upcoming calendar events that have a Google Meet link.
+    Useful for showing what meetings are coming up before syncing.
+    """
+    from app.services.integrations.google_meet import google_meet_service
+
+    google = _get_integration(current_user, "google")
+    if not google.get("refresh_token") and not google.get("access_token") and not google.get("api_key"):
+        raise HTTPException(status_code=400, detail="Google is not connected")
+
+    resolved_calendar_id = calendar_id or google.get("calendar_id") or "primary"
+
+    if google.get("refresh_token") or google.get("access_token"):
+        access_token = await _get_google_access_token(db=db, current_user=current_user)
+        events = await google_meet_service.list_upcoming_meet_events(
+            access_token=access_token,
+            calendar_id=resolved_calendar_id,
+            days_ahead=min(days_ahead, 180),
+        )
+    else:
+        # API key path — use existing sync logic
+        raise HTTPException(
+            status_code=400,
+            detail="Listing upcoming Meet events requires OAuth (not API key). Please reconnect with OAuth.",
+        )
+
+    return {"events": events, "count": len(events), "calendar_id": resolved_calendar_id}
 
 
 @router.post("/google/sync")
@@ -2737,9 +2877,10 @@ async def run_auto_sync_now(
     elif zoom.get("account_id"):
         results["zoom"] = {"status": "skipped", "detail": "Auto sync disabled"}
 
-    if (google.get("api_key") or google.get("service_account_json")) and _is_auto_sync_enabled(current_user, "google"):
+    google_connected = bool(google.get("access_token") or google.get("refresh_token") or google.get("api_key") or google.get("service_account_json"))
+    if google_connected and _is_auto_sync_enabled(current_user, "google"):
         await _run("google", sync_google_meetings(days_ahead=30, limit=50, db=db, current_user=current_user))
-    elif google.get("api_key") or google.get("service_account_json"):
+    elif google_connected:
         results["google"] = {"status": "skipped", "detail": "Auto sync disabled"}
 
     if ms.get("tenant_id") and _is_auto_sync_enabled(current_user, "microsoft"):
