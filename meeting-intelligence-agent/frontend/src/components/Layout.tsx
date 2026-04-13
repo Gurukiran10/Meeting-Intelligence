@@ -1,5 +1,5 @@
 import React from 'react'
-import { Outlet, NavLink } from 'react-router-dom'
+import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import {
   LayoutDashboard,
@@ -22,6 +22,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { Separator } from '@/components/ui/separator'
 
 const Layout: React.FC = () => {
+  const navigate = useNavigate()
   const { data: currentUser } = useQuery('current-user', async () => {
     const response = await api.get('/api/v1/auth/me')
     return response.data
@@ -138,16 +139,16 @@ const Layout: React.FC = () => {
              <span className="text-slate-900">General</span>
           </div>
           <div className="flex items-center space-x-3">
-             <Button variant="outline" size="sm" className="hidden md:flex items-center text-slate-500 border-slate-200">
+             <Button variant="outline" size="sm" className="hidden md:flex items-center text-slate-500 border-slate-200" onClick={() => navigate('/integrations')}>
                 <Plug className="w-4 h-4 mr-2" />
                 Connect Integrations
              </Button>
              <Separator orientation="vertical" className="h-6 mx-1 hidden md:block" />
-             <Button variant="ghost" size="icon" className="relative text-slate-500 hover:text-blue-600 transition-colors">
+             <Button variant="ghost" size="icon" className="relative text-slate-500 hover:text-blue-600 transition-colors" onClick={() => navigate('/mentions')}>
                 <Bell className="w-5 h-5" />
                 <span className="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full border-2 border-white"></span>
              </Button>
-             <Button variant="ghost" size="icon" className="text-slate-500 hover:text-blue-600 transition-colors">
+             <Button variant="ghost" size="icon" className="text-slate-500 hover:text-blue-600 transition-colors" onClick={() => navigate('/settings')}>
                 <Settings className="w-5 h-5" />
              </Button>
           </div>

@@ -6,7 +6,7 @@ from datetime import datetime
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, cast, String
 from pydantic import BaseModel
 
 from app.core.database import get_db
@@ -98,8 +98,8 @@ async def list_meetings(
     """List user meetings"""
     query = select(Meeting).where(
         (Meeting.organizer_id == current_user.id) |
-        (Meeting.attendee_ids.contains([str(current_user.id)]))
-    )
+        (cast(Meeting.attendee_ids, String).contains(str(current_user.id)))
+    ).where(Meeting.deleted_at.is_(None))
     
     if status:
         query = query.where(Meeting.status == status)
@@ -180,7 +180,7 @@ async def upload_recording(
     db.commit()
     
     # Trigger background processing
-    background_tasks.add_task(process_meeting_recording_background, str(meeting_id), file_path)
+    background_tasks.add_task(process_meeting_recording_background, meeting.id, file_path)
     
     return meeting
 

@@ -39,11 +39,11 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: meeting-intel-backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8002:8000"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/meeting_intel
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_intel
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
@@ -67,7 +67,7 @@ services:
     container_name: meeting-intel-celery
     command: celery -A app.core.celery:celery_app worker --loglevel=info
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/meeting_intel
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_intel
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
@@ -89,7 +89,7 @@ services:
     container_name: meeting-intel-celery-beat
     command: celery -A app.core.celery:celery_app beat --loglevel=info
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/meeting_intel
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_intel
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
@@ -111,7 +111,7 @@ services:
     ports:
       - "3002:3000"
     environment:
-      - VITE_API_URL=http://localhost:8002
+      - VITE_API_PROXY_TARGET=http://host.docker.internal:8002
     volumes:
       - ./frontend:/app
       - /app/node_modules

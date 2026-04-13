@@ -4,7 +4,7 @@ from datetime import datetime
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from sqlalchemy import select, or_, case
+from sqlalchemy import select, or_, case, cast, String
 from pydantic import BaseModel
 
 from app.core.database import get_db
@@ -145,11 +145,10 @@ async def list_action_items(
     db: Session = Depends(get_db),
 ):
     """List user's action items"""
-    query = select(ActionItem).where(
+    query = select(ActionItem).filter(
         or_(
             ActionItem.owner_id == current_user.id,
-            ActionItem.collaborator_ids.contains([str(current_user.id)]),
-            ActionItem.collaborator_ids.contains(str(current_user.id)),
+            cast(ActionItem.collaborator_ids, String).contains(str(current_user.id)),
         )
     )
     

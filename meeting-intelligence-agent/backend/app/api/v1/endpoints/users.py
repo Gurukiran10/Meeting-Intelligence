@@ -19,7 +19,7 @@ class UserResponse(BaseModel):
     email: str
     username: str
     full_name: str
-    role: str
+    role: Optional[str] = None
     timezone: Optional[str]
     department: Optional[str]
     job_title: Optional[str]

@@ -19,9 +19,12 @@ const Meetings: React.FC = () => {
     scheduled_end: '',
   })
 
-  const { data: meetings, isLoading, refetch } = useQuery('meetings', async () => {
-    const response = await api.get('/api/v1/meetings/')
+  const { data: meetings, isLoading, isError, error, refetch } = useQuery('meetings', async () => {
+    const response = await api.get('/api/v1/meetings/', { timeout: 15000 })
     return response.data
+  }, {
+    retry: 1,
+    refetchOnWindowFocus: false,
   })
 
   const filteredMeetings = useMemo(() => {
@@ -204,6 +207,20 @@ const Meetings: React.FC = () => {
       <div className="bg-white rounded-xl shadow-sm border border-gray-200">
         {isLoading ? (
           <div className="p-8 text-center text-gray-500">Loading meetings...</div>
+        ) : isError ? (
+          <div className="p-8 text-center">
+            <p className="text-red-600 text-sm">
+              {(error as any)?.response?.data?.detail ||
+                (error as any)?.message ||
+                'Could not load meetings right now.'}
+            </p>
+            <button
+              onClick={() => refetch()}
+              className="mt-3 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"
+            >
+              Retry
+            </button>
+          </div>
         ) : filteredMeetings && filteredMeetings.length > 0 ? (
           <div className="divide-y divide-gray-200">
             {filteredMeetings.map((meeting: any) => (
@@ -245,7 +262,7 @@ const Meetings: React.FC = () => {
         ) : (
           <div className="p-12 text-center">
             <p className="text-gray-500">No meetings found.</p>
-            <button className="mt-4 text-primary-600 hover:text-primary-700 font-medium">
+            <button onClick={() => setShowCreate(true)} className="mt-4 text-primary-600 hover:text-primary-700 font-medium">
               Upload your first meeting recording
             </button>
           </div>

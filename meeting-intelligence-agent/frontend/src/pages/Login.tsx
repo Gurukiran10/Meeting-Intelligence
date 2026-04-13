@@ -5,13 +5,14 @@ import { isAuthenticated, setTokens } from '../lib/auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
-import { AlertCircle, Lock, User } from 'lucide-react'
+import { AlertCircle, Lock, User, Eye, EyeOff } from 'lucide-react'
 
 const Login: React.FC = () => {
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('admin123')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
 
   if (isAuthenticated()) {
     return <Navigate to="/dashboard" replace />
@@ -36,7 +37,17 @@ const Login: React.FC = () => {
       setTokens(response.data.access_token, response.data.refresh_token)
       window.location.href = '/dashboard'
     } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Login failed. Please check your credentials.')
+      const detail = e?.response?.data?.detail
+      if (detail) {
+        setError(String(detail))
+      } else if (e?.code === 'ECONNABORTED') {
+        setError('Login request timed out. Backend may be busy. Please try again in a few seconds.')
+      } else if (!e?.response) {
+        const target = String(api.defaults.baseURL || 'http://localhost:8002')
+        setError(`Cannot reach backend at ${target}. Make sure backend is running and reachable.`)
+      } else {
+        setError('Login failed. Please check your credentials.')
+      }
     } finally {
       setLoading(false)
     }
@@ -74,13 +85,21 @@ const Login: React.FC = () => {
               <div className="relative">
                 <Lock className="absolute left-3 top-3 h-4 w-4 text-slate-400" />
                 <Input
-                  type="password"
+                  type={showPassword ? "text" : "password"}
                   placeholder="Password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="pl-10"
+                  className="pl-10 pr-10"
                   required
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 focus:outline-none"
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
               </div>
             </div>
 

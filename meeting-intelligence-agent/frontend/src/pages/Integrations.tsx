@@ -106,6 +106,7 @@ function ConnectModal({ integration, onClose, onConnected }: ConnectModalProps) 
       const calendarId = (fields.calendar_id || '').trim() || 'primary'
       const clientId = (fields.client_id || '').trim() || undefined
       const clientSecret = (fields.client_secret || '').trim() || undefined
+      const redirectUri = (fields.redirect_uri || '').trim() || undefined
 
       sessionStorage.removeItem('mia_google_oauth_last_processed_code')
 
@@ -113,11 +114,13 @@ function ConnectModal({ integration, onClose, onConnected }: ConnectModalProps) 
         calendar_id: calendarId,
         client_id: clientId,
         client_secret: clientSecret,
+        redirect_uri: redirectUri,
         created_at: Date.now(),
       }))
 
       const params: Record<string, string> = { calendar_id: calendarId }
       if (clientId) params.client_id = clientId
+      if (redirectUri) params.redirect_uri = redirectUri
 
       const response = await api.get('/api/v1/integrations/google/oauth-url', { params })
 
@@ -512,14 +515,24 @@ export default function Integrations() {
     runGoogleOAuthCallback()
   }, [navigate, qc, searchParams])
 
-  const { data: integrations = [], isLoading } = useQuery(
+  const {
+    data: integrations = [],
+    isLoading,
+    isError: integrationsError,
+    error: integrationsErrorObj,
+    refetch: refetchIntegrations,
+  } = useQuery(
     'integrations',
-    () => api.get('/api/v1/integrations/').then(r => r.data as Integration[]),
+    () => api.get('/api/v1/integrations/', { timeout: 15000 }).then(r => r.data as Integration[]),
+    {
+      retry: 1,
+      refetchOnWindowFocus: false,
+    },
   )
 
   const { data: autoSyncStatus } = useQuery(
     'auto-sync-status',
-    () => api.get('/api/v1/integrations/auto-sync/status').then(r => r.data as {
+    () => api.get('/api/v1/integrations/auto-sync/status', { timeout: 10000 }).then(r => r.data as {
       last_run_at?: string
       next_run_at?: string
       enabled?: Record<string, boolean>
@@ -536,7 +549,7 @@ export default function Integrations() {
 
   useQuery(
     'capture-policy',
-    () => api.get('/api/v1/integrations/capture-policy').then(r => r.data as {
+    () => api.get('/api/v1/integrations/capture-policy', { timeout: 10000 }).then(r => r.data as {
       auto_join_enabled: boolean
       auto_transcription_enabled: boolean
       retention_days: number
@@ -546,6 +559,7 @@ export default function Integrations() {
       min_team_size: number
     }),
     {
+      retry: 1,
       onSuccess: (data) => {
         setCapturePolicyForm({
           auto_join_enabled: !!data.auto_join_enabled,
@@ -929,6 +943,20 @@ export default function Integrations() {
         {isLoading ? (
           <div className="flex justify-center py-12">
             <div className="h-8 w-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+          </div>
+        ) : integrationsError ? (
+          <div className="bg-white rounded-xl border p-6 text-center">
+            <p className="text-sm text-red-600">
+              {(integrationsErrorObj as any)?.response?.data?.detail ||
+                (integrationsErrorObj as any)?.message ||
+                'Could not load integrations right now.'}
+            </p>
+            <button
+              onClick={() => refetchIntegrations()}
+              className="mt-3 text-xs px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded-lg hover:bg-indigo-100 font-medium transition-colors"
+            >
+              Retry
+            </button>
           </div>
         ) : (
           <>

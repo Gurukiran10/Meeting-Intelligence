@@ -1,10 +1,13 @@
 import axios from 'axios'
 import { clearTokens, getAccessToken } from './auth'
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8002'
+const envApiBaseUrl = import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL
+const defaultApiBaseUrl = ''
+const API_BASE_URL = envApiBaseUrl || defaultApiBaseUrl
 
 export const api = axios.create({
   baseURL: API_BASE_URL,
+  timeout: 60000,
 })
 
 api.interceptors.request.use((config) => {

@@ -35,11 +35,14 @@ class User(Base):
     # Preferences
     preferences = Column(JSON, default={})
     notification_settings = Column(JSON, default={
-        "email_enabled": True,
-        "slack_enabled": True,
-        "real_time_mentions": True,
-        "daily_digest": True,
-        "action_reminders": True,
+        "email_enabled": True,              # Receive email notifications
+        "slack_enabled": True,              # Receive Slack notifications
+        "real_time_mentions": True,         # Real-time mention alerts
+        "daily_digest": True,               # Daily digest summary
+        "action_reminders": True,           # Action item reminders
+        "mention_confidence_threshold": 0.7,# Only alert if confidence >= threshold
+        "digest_time": "08:00",            # Time of day for digest (HH:MM)
+        "alert_channels": ["slack", "email"], # Channels for alerts
     })
     
     # Integrations

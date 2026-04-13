@@ -1,5 +1,6 @@
 import React from 'react'
 import { useQuery } from 'react-query'
+import { useNavigate } from 'react-router-dom'
 import { 
   Calendar, 
   Clock, 
@@ -19,6 +20,8 @@ import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 
 const Dashboard: React.FC = () => {
+  const navigate = useNavigate()
+  
   const { data: analytics } = useQuery('analytics', async () => {
     const response = await api.get('/api/v1/analytics/dashboard')
     return response.data
@@ -79,11 +82,11 @@ const Dashboard: React.FC = () => {
           </p>
         </div>
         <div className="flex space-x-3">
-           <Button variant="outline" className="border-slate-200">
+           <Button variant="outline" className="border-slate-200" onClick={() => navigate('/analytics')}>
               <FileText className="w-4 h-4 mr-2" />
               Reports
            </Button>
-           <Button className="bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-200">
+           <Button className="bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-200" onClick={() => navigate('/meetings')}>
               <Plus className="w-4 h-4 mr-2" />
               New Meeting
            </Button>
@@ -118,12 +121,12 @@ const Dashboard: React.FC = () => {
               <CardTitle className="text-xl font-bold">Recent Meetings</CardTitle>
               <CardDescription>Your latest collaborations and recordings.</CardDescription>
             </div>
-            <Button variant="ghost" size="sm" className="text-blue-600 font-bold hover:text-blue-700 hover:bg-blue-50">View all</Button>
+            <Button variant="ghost" size="sm" className="text-blue-600 font-bold hover:text-blue-700 hover:bg-blue-50" onClick={() => navigate('/meetings')}>View all</Button>
           </CardHeader>
           <CardContent className="pt-4">
             <div className="space-y-4">
               {recentMeetings.length > 0 ? recentMeetings.map((meeting: any) => (
-                <div key={meeting.id} className="flex items-center justify-between p-4 rounded-xl border border-slate-100 hover:bg-slate-50/50 hover:border-slate-200 transition-all group cursor-pointer">
+                <div key={meeting.id} onClick={() => navigate(`/meetings/${meeting.id}`)} className="flex items-center justify-between p-4 rounded-xl border border-slate-100 hover:bg-slate-50/50 hover:border-slate-200 transition-all group cursor-pointer">
                   <div className="flex items-center space-x-4">
                     <div className="bg-slate-100 p-2.5 rounded-lg group-hover:bg-white transition-colors">
                       <Video className="w-5 h-5 text-slate-600" />
@@ -199,7 +202,7 @@ const Dashboard: React.FC = () => {
             </div>
           </CardContent>
           <div className="p-6 pt-0 mt-auto">
-             <Button variant="outline" className="w-full border-slate-200 text-slate-600 font-bold hover:bg-slate-50 transition-colors">
+             <Button variant="outline" className="w-full border-slate-200 text-slate-600 font-bold hover:bg-slate-50 transition-colors" onClick={() => navigate('/action-items')}>
                 View All Actions
              </Button>
           </div>

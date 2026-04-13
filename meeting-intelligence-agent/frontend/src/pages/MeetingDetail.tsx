@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { useQuery } from 'react-query'
 import { Link, useParams } from 'react-router-dom'
 import { UploadCloud } from 'lucide-react'
@@ -78,6 +78,33 @@ const MeetingDetail: React.FC = () => {
     }
     return ''
   }, [meeting])
+
+  useEffect(() => {
+    if (!meeting || !uploadMessage || uploadMessage.type !== 'success') return
+
+    const status = String(meeting.status || '').toLowerCase()
+    const transcriptionStatus = String(meeting.transcription_status || '').toLowerCase()
+    const analysisStatus = String(meeting.analysis_status || '').toLowerCase()
+
+    const isProcessing =
+      ['transcribing', 'processing', 'in_progress'].includes(status) ||
+      transcriptionStatus === 'processing' ||
+      analysisStatus === 'processing'
+
+    const isFailed =
+      status === 'failed' ||
+      transcriptionStatus === 'failed' ||
+      analysisStatus === 'failed'
+
+    if (isFailed) {
+      setUploadMessage({ type: 'error', text: 'Processing failed. Please upload again.' })
+      return
+    }
+
+    if (!isProcessing && uploadMessage.text === 'Upload successful. Processing started.') {
+      setUploadMessage({ type: 'success', text: 'Processing complete.' })
+    }
+  }, [meeting, uploadMessage])
 
   const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]

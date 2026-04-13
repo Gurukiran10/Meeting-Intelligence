@@ -307,63 +307,70 @@ async def detect_and_store_mentions(
             full_context=detection.context[:2000],
             context_before=(detection.context[:900] if detection.context else None),
             context_after=None,
-            is_action_item=bool(detection.is_action_item),
-            is_question=bool(detection.is_question),
-            is_decision=detection.mention_type == "decision_impact",
+            is_action_item=bool(getattr(detection, 'is_action_item', False)),
+            is_question=bool(getattr(detection, 'is_question', False)),
+            is_decision=detection.mention_type in ["decision_impact", "decision"],
             is_feedback=detection.mention_type == "feedback",
-            relevance_score=float(detection.relevance_score),
+            relevance_score=float(getattr(detection, 'relevance_score', 0)),
             urgency_score=_calculate_urgency(detection),
-            sentiment="neutral",
-            detection_method="personalized_heuristic",
-            confidence=max(min(float(detection.relevance_score) / 100.0, 1.0), 0.0),
+            sentiment=getattr(detection, 'sentiment', "neutral"),
+            sentiment_score=getattr(detection, 'sentiment_score', None),
+            detection_method=getattr(detection, 'detection_method', "personalized_heuristic"),
+            confidence=max(min(float(getattr(detection, 'relevance_score', 0)) / 100.0, 1.0), 0.0),
             mention_metadata={
                 "meeting_title": meeting.title,
                 "platform": meeting.platform,
                 "transcript_id": transcript_id,
                 "meeting_url": meeting_link,
+                "matched_alias": getattr(detection, 'matched_alias', None),
+                "matched_keyword": getattr(detection, 'matched_keyword', None),
+                "decision_signal": getattr(detection, 'decision_signal', None),
                 **alert_details,
             },
         )
         db.add(mention)
         db.flush()
 
+
         notification_settings = _as_dict(matched_user.notification_settings)
         slack_settings = dict((matched_user.integrations or {}).get("slack", {}))
         recipient_email = _as_optional_str(matched_user.email)
-        should_send_slack = bool(
-            send_real_time_alerts
-            and notification_settings.get("slack_enabled", True)
-            and notification_settings.get("real_time_mentions", True)
-            and slack_settings.get("bot_token")
-            and recipient_email
-        )
+        confidence_threshold = float(notification_settings.get("mention_confidence_threshold", 0.7))
+        alert_channels = notification_settings.get("alert_channels", ["slack", "email"])
+        mention_confidence = float(getattr(mention, "confidence", 0.0))
 
-        if should_send_slack:
-            assert recipient_email is not None
-            try:
-                await slack_service.send_mention_alert_via_token(
-                    bot_token=slack_settings["bot_token"],
-                    recipient_email=recipient_email,
-                    mention_data={
-                        "id": str(mention.id),
-                        "meeting_id": str(meeting.id),
-                        "mention_type": detection.mention_type,
-                        "text": detection.text,
-                        "context": detection.context,
-                        "relevance_score": detection.relevance_score,
-                        "urgency_score": mention.urgency_score,
-                        "is_action_item": detection.is_action_item,
-                        "is_question": detection.is_question,
-                        **alert_details,
-                    },
-                    meeting_title=str(meeting.title),
-                    meeting_url=meeting_link,
-                )
-                setattr(mention, "notification_sent", True)
-                setattr(mention, "notification_sent_at", datetime.utcnow())
-                setattr(mention, "notification_type", "slack")
-            except Exception as exc:
-                logger.warning("Failed to send mention alert for %s: %s", matched_user.email, exc)
+        # Only send alert if confidence meets threshold
+        if send_real_time_alerts and mention_confidence >= confidence_threshold:
+            # Slack alert
+            if "slack" in alert_channels and notification_settings.get("slack_enabled", True) and notification_settings.get("real_time_mentions", True) and slack_settings.get("bot_token") and recipient_email:
+                try:
+                    await slack_service.send_mention_alert_via_token(
+                        bot_token=slack_settings["bot_token"],
+                        recipient_email=recipient_email,
+                        mention_data={
+                            "id": str(mention.id),
+                            "meeting_id": str(meeting.id),
+                            "mention_type": detection.mention_type,
+                            "text": detection.text,
+                            "context": detection.context,
+                            "relevance_score": detection.relevance_score,
+                            "urgency_score": mention.urgency_score,
+                            "is_action_item": detection.is_action_item,
+                            "is_question": detection.is_question,
+                            **alert_details,
+                        },
+                        meeting_title=str(meeting.title),
+                        meeting_url=meeting_link,
+                    )
+                    setattr(mention, "notification_sent", True)
+                    setattr(mention, "notification_sent_at", datetime.utcnow())
+                    setattr(mention, "notification_type", "slack")
+                except Exception as exc:
+                    logger.warning("Failed to send mention alert for %s: %s", matched_user.email, exc)
+            # Email alert (placeholder for future implementation)
+            if "email" in alert_channels and notification_settings.get("email_enabled", True) and recipient_email:
+                # TODO: Implement email alert logic
+                pass
 
         created_mentions.append(mention)
 

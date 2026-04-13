@@ -4,12 +4,18 @@ Background Tasks for Meeting Processing
 import logging
 from datetime import datetime
 from typing import List, Optional
+from uuid import UUID
 from celery import shared_task
 from app.core.database import SessionLocal
 from app.services.ai.transcription import transcription_service
 from app.services.ai.nlp import nlp_service
 from app.services.integrations.slack import slack_service
 from app.services.mentions import detect_and_store_mentions
+from app.core.meeting_operations import (
+    get_or_create_notification_tracking,
+    mark_notification_failed,
+    mark_notification_sent,
+)
 from app.models.meeting import Meeting
 from app.models.transcript import Transcript
 from app.models.action_item import ActionItem
@@ -48,8 +54,17 @@ def _parse_due_date(value: Optional[str]):
         return None
 
 
+def _normalize_meeting_id(meeting_id: str | UUID) -> Optional[UUID]:
+    if isinstance(meeting_id, UUID):
+        return meeting_id
+    try:
+        return UUID(str(meeting_id))
+    except (ValueError, TypeError):
+        return None
+
+
 @shared_task(name="process_meeting_recording")
-def process_meeting_recording(meeting_id: str, recording_path: str):
+def process_meeting_recording(meeting_id: str | UUID, recording_path: str):
     """
     Process meeting recording:
     1. Transcribe audio with speaker diarization
@@ -61,7 +76,7 @@ def process_meeting_recording(meeting_id: str, recording_path: str):
     asyncio.run(_process_meeting_async(meeting_id, recording_path))
 
 
-def process_meeting_recording_background(meeting_id: str, recording_path: str):
+def process_meeting_recording_background(meeting_id: str | UUID, recording_path: str):
     """FastAPI BackgroundTasks entrypoint for meeting processing"""
     import asyncio
     import threading
@@ -72,14 +87,19 @@ def process_meeting_recording_background(meeting_id: str, recording_path: str):
     threading.Thread(target=_runner, daemon=True).start()
 
 
-async def _process_meeting_async(meeting_id: str, recording_path: str):  # type: ignore
+async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  # type: ignore
     """Async implementation of meeting processing"""
     meeting = None
+    normalized_meeting_id = _normalize_meeting_id(meeting_id)
+    if not normalized_meeting_id:
+        logger.error(f"Invalid meeting id provided to processor: {meeting_id}")
+        return
+
     with SessionLocal() as db:
         try:
             # Get meeting
             result = db.execute(
-                select(Meeting).where(Meeting.id == meeting_id)
+                select(Meeting).where(Meeting.id == normalized_meeting_id)
             )
             meeting = result.scalar_one_or_none()
             
@@ -116,6 +136,7 @@ async def _process_meeting_async(meeting_id: str, recording_path: str):  # type:
             
             # Step 2: Analyze with NLP
             logger.info(f"Analyzing meeting {meeting_id}")
+            meeting.status = "processing"  # type: ignore
             meeting.analysis_status = "processing"  # type: ignore
             db.commit()
             
@@ -180,17 +201,65 @@ async def _process_meeting_async(meeting_id: str, recording_path: str):  # type:
             if organizer:
                 slack_creds = (organizer.integrations or {}).get("slack", {})
                 if slack_creds.get("bot_token"):
-                    try:
-                        logger.info(f"Sending Slack notification for meeting {meeting_id}")
-                        await _notify_slack(
-                            token=slack_creds["bot_token"],
-                            channel=slack_creds.get("default_channel", "#general"),
-                            meeting=meeting,
-                            action_count=len(summary.action_items),
-                            decision_count=len(summary.decisions),
+                    channel = slack_creds.get("default_channel", "#general")
+                    notification = get_or_create_notification_tracking(
+                        db=db,
+                        meeting_id=str(meeting.id),
+                        notification_type="slack_meeting_summary",
+                        provider="slack",
+                        recipient=str(channel),
+                        payload={
+                            "meeting_id": str(meeting.id),
+                            "action_count": len(summary.action_items),
+                            "decision_count": len(summary.decisions),
+                        },
+                    )
+
+                    if notification.status == "sent":
+                        logger.info(
+                            "Skipping duplicate Slack notification for meeting %s (key=%s)",
+                            meeting_id,
+                            notification.idempotency_key,
                         )
-                    except Exception as slack_err:
-                        logger.warning(f"Slack notification failed (non-fatal): {slack_err}")
+                    else:
+                        try:
+                            logger.info(f"Sending Slack notification for meeting {meeting_id}")
+                            slack_result = await _notify_slack(
+                                token=slack_creds["bot_token"],
+                                channel=channel,
+                                meeting=meeting,
+                                action_count=len(summary.action_items),
+                                decision_count=len(summary.decisions),
+                            )
+
+                            if slack_result.get("ok") is True:
+                                mark_notification_sent(
+                                    db=db,
+                                    idempotency_key=notification.idempotency_key,
+                                    response_status="200",
+                                    response_body=str(slack_result.get("ts", "ok")),
+                                )
+                            else:
+                                error_message = str(slack_result.get("error", "unknown_slack_error"))
+                                mark_notification_failed(
+                                    db=db,
+                                    idempotency_key=notification.idempotency_key,
+                                    error_message=error_message,
+                                    response_status="400",
+                                )
+                                logger.warning(
+                                    "Slack notification rejected for meeting %s: %s",
+                                    meeting_id,
+                                    error_message,
+                                )
+                        except Exception as slack_err:
+                            mark_notification_failed(
+                                db=db,
+                                idempotency_key=notification.idempotency_key,
+                                error_message=str(slack_err),
+                                response_status="500",
+                            )
+                            logger.warning(f"Slack notification failed (non-fatal): {slack_err}")
 
             # Step 4: Create Linear issues for action items (if organizer has Linear connected)
             if organizer and summary.action_items:
@@ -216,7 +285,7 @@ async def _process_meeting_async(meeting_id: str, recording_path: str):  # type:
                 except Exception:
                     pass
                 try:
-                    result = db.execute(select(Meeting).where(Meeting.id == meeting_id))
+                    result = db.execute(select(Meeting).where(Meeting.id == normalized_meeting_id))
                     failed_meeting = result.scalar_one_or_none()
                     if failed_meeting:
                         failed_meeting.transcription_status = "failed"  # type: ignore
@@ -299,11 +368,15 @@ async def _notify_slack(token: str, channel: str, meeting: "Meeting", action_cou
         },
     ]
     async with httpx.AsyncClient() as client:
-        await client.post(
+        response = await client.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}"},
             json={"channel": channel, "blocks": blocks, "text": f"Meeting completed: {meeting.title}"},
         )
+        try:
+            return response.json()
+        except ValueError:
+            return {"ok": False, "error": f"non_json_response_{response.status_code}"}
 
 
 # ─── Linear helper ───────────────────────────────────────────────────────────

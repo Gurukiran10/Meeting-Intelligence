@@ -52,24 +52,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
         interval_seconds = max(settings.INTEGRATION_AUTO_SYNC_INTERVAL_MINUTES, 5) * 60
         while True:
+            await asyncio.sleep(interval_seconds)
             try:
-                result = await run_integration_auto_sync_for_all_users()
+                result = await asyncio.wait_for(run_integration_auto_sync_for_all_users(), timeout=180)
                 logger.info(f"Integration auto-sync completed: {result}")
+            except asyncio.TimeoutError:
+                logger.error("Integration auto-sync timed out after 180 seconds")
             except Exception as exc:
                 logger.error(f"Integration auto-sync failed: {exc}", exc_info=True)
-            await asyncio.sleep(interval_seconds)
 
     async def _retention_loop():
         from app.api.v1.endpoints.integrations import run_retention_enforcement_for_all_users
 
         interval_seconds = max(settings.RETENTION_ENFORCEMENT_INTERVAL_MINUTES, 60) * 60
         while True:
+            await asyncio.sleep(interval_seconds)
             try:
-                result = await run_retention_enforcement_for_all_users()
+                result = await asyncio.wait_for(run_retention_enforcement_for_all_users(), timeout=120)
                 logger.info(f"Retention enforcement completed: {result}")
+            except asyncio.TimeoutError:
+                logger.error("Retention enforcement timed out after 120 seconds")
             except Exception as exc:
                 logger.error(f"Retention enforcement failed: {exc}", exc_info=True)
-            await asyncio.sleep(interval_seconds)
 
     # Startup
     logger.info("Starting Meeting Intelligence Agent...")

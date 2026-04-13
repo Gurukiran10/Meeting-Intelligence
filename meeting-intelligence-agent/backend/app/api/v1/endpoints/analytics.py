@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, cast, String
 from sqlalchemy.orm import Session
 
 from app.api.v1.endpoints.auth import get_current_user
@@ -78,8 +78,7 @@ async def get_analytics_dashboard(
     meeting_query = select(Meeting).where(
         or_(
             Meeting.organizer_id == current_user.id,
-            Meeting.attendee_ids.contains([str(current_user.id)]),
-            Meeting.attendee_ids.contains(str(current_user.id)),
+            cast(Meeting.attendee_ids, String).contains(str(current_user.id)),
         )
     )
     meetings = db.execute(meeting_query).scalars().all()
@@ -155,8 +154,7 @@ async def get_meeting_efficiency(
         select(Meeting).where(
             or_(
                 Meeting.organizer_id == current_user.id,
-                Meeting.attendee_ids.contains([str(current_user.id)]),
-                Meeting.attendee_ids.contains(str(current_user.id)),
+                cast(Meeting.attendee_ids, String).contains(str(current_user.id)),
             )
         )
     ).scalars().all()

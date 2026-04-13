@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # Grok (xAI)
     GROK_API_KEY: str = ""
     GROK_BASE_URL: str = "https://api.x.ai/v1"
-    GROK_MODEL: str = "grok-2-latest"
+    GROK_MODEL: str = "grok-beta"
     
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     WHISPER_MODEL: str = "large-v3"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "float16"
+    WHISPER_LOAD_TIMEOUT_SECONDS: int = 30
+    WHISPER_TRANSCRIBE_TIMEOUT_SECONDS: int = 180
+    WHISPER_DIARIZATION_TIMEOUT_SECONDS: int = 45
     
     # Pinecone
     PINECONE_API_KEY: str = ""

@@ -98,6 +98,79 @@ class NLPService:
             return [part.strip() for part in re.split(r",|\n|;|\|", value) if part.strip()]
         return []
 
+    def _normalize_decision(self, decision_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize decision data from different AI provider formats"""
+        return {
+            "decision": (
+                decision_data.get("decision") or 
+                decision_data.get("Decision") or 
+                decision_data.get("summary") or 
+                ""
+            ),
+            "reasoning": (
+                decision_data.get("reasoning") or 
+                decision_data.get("reason") or 
+                decision_data.get("Why") or 
+                ""
+            ),
+            "alternatives": self._safe_list(
+                decision_data.get("alternatives") or 
+                decision_data.get("Alternatives Considered") or 
+                []
+            ),
+            "decision_maker": (
+                decision_data.get("decision_maker") or 
+                decision_data.get("decided_by") or 
+                decision_data.get("Who Decided") or 
+                None
+            ),
+            "is_reversible": (
+                decision_data.get("is_reversible") or 
+                (decision_data.get("Is Reversible") == "Yes" if isinstance(decision_data.get("Is Reversible"), str) else 
+                 decision_data.get("reversible") == "Yes" if isinstance(decision_data.get("reversible"), str) else False)
+            ),
+            "impact_level": (
+                decision_data.get("impact_level") or 
+                decision_data.get("Impact Level") or 
+                "medium"
+            ),
+        }
+
+    def _normalize_action_item(self, item_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize action item data from different AI provider formats"""
+        return {
+            "title": (
+                item_data.get("title") or 
+                item_data.get("task") or 
+                item_data.get("Task") or 
+                ""
+            ),
+            "description": (
+                item_data.get("description") or 
+                item_data.get("task") or 
+                item_data.get("Task") or 
+                ""
+            ),
+            "owner": (
+                item_data.get("owner") or 
+                item_data.get("Owner") or 
+                item_data.get("assigned_to") or 
+                None
+            ),
+            "due_date": (
+                item_data.get("due_date") or 
+                item_data.get("deadline") or 
+                item_data.get("Deadline") or 
+                None
+            ),
+            "priority": (
+                item_data.get("priority") or 
+                item_data.get("Priority") or 
+                "medium"
+            ).lower(),
+            "confidence": float(item_data.get("confidence") or item_data.get("Confidence") or 0.8),
+        }
+
     def _normalize_user_profile(self, user_profile: Dict[str, Any]) -> Dict[str, Any]:
         preferences = user_profile.get("preferences") or {}
         name = str(user_profile.get("name") or "").strip()
@@ -307,21 +380,7 @@ class NLPService:
             except Exception as exc:
                 logger.warning(f"Claude generation failed, trying Grok fallback: {exc}")
 
-        if self.grok_client:
-            try:
-                response = await self.grok_client.chat.completions.create(  # type: ignore
-                    model=settings.GROK_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=temperature,
-                )
-                return json.loads(response.choices[0].message.content or "{}")  # type: ignore
-            except Exception as exc:
-                logger.warning(f"Grok generation failed: {exc}")
-
+        # Try Groq first (free tier available, fast)
         if self.groq_client:
             try:
                 response = await self.groq_client.chat.completions.create(  # type: ignore
@@ -336,6 +395,22 @@ class NLPService:
                 return json.loads(response.choices[0].message.content or "{}")  # type: ignore
             except Exception as exc:
                 logger.warning(f"Groq generation failed: {exc}")
+
+        # Fallback to Grok (xAI) - requires paid credits
+        if self.grok_client:
+            try:
+                response = await self.grok_client.chat.completions.create(  # type: ignore
+                    model=settings.GROK_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=temperature,
+                )
+                return json.loads(response.choices[0].message.content or "{}")  # type: ignore
+            except Exception as exc:
+                logger.warning(f"Grok generation failed: {exc}")
 
         return {}
     
@@ -547,6 +622,12 @@ Return a JSON object.
             user_prompt=prompt,
             temperature=0.3,
         )
+        logger.info(f"Summary data returned: {summary_data}")
+        
+        # Handle nested response from Groq API
+        if summary_data and "meeting_summary" in summary_data:
+            summary_data = summary_data["meeting_summary"]
+            logger.info(f"Extracted nested summary data: {summary_data}")
 
         if not summary_data:
             cleaned_lines = [line.strip() for line in transcript.splitlines() if line.strip()]
@@ -564,18 +645,79 @@ Return a JSON object.
                 sentiment_score=0.0,
             )
         
+        # Normalize decision data - could be a single dict or list
+        # Try multiple key formats (snake_case and Title Case from Groq)
+        decisions_data = (
+            summary_data.get("decisions") or 
+            summary_data.get("decisions_made") or
+            summary_data.get("Decisions Made") or
+            summary_data.get("Decisions") or
+            []
+        )
+        if isinstance(decisions_data, dict):
+            # If it's a dict of decisions (e.g., {"Launch Date": {...}}), convert to list
+            decisions_data = list(decisions_data.values()) if decisions_data else []
+        elif not isinstance(decisions_data, list):
+            decisions_data = []
+        
+        # Normalize action items
+        action_items_data = (
+            summary_data.get("action_items") or
+            summary_data.get("Action Items") or
+            summary_data.get("action_items") or
+            []
+        )
+        if isinstance(action_items_data, dict):
+            action_items_data = list(action_items_data.values()) if action_items_data else []
+        elif not isinstance(action_items_data, list):
+            action_items_data = []
+        
         # Parse into structured format
+        decisions = []
+        for d in decisions_data:
+            if isinstance(d, dict):
+                try:
+                    decisions.append(Decision(**self._normalize_decision(d)))
+                except Exception as e:
+                    logger.warning(f"Failed to parse decision: {e}")
+        logger.info(f"Successfully parsed {len(decisions)} decisions from {len(decisions_data)} data items")
+        
+        action_items = []
+        for a in action_items_data:
+            if isinstance(a, dict):
+                try:
+                    action_items.append(ActionItem(**self._normalize_action_item(a)))
+                except Exception as e:
+                    logger.warning(f"Failed to parse action item: {e}")
+        
         summary = MeetingSummary(
-            executive_summary=summary_data.get("executive_summary", ""),
-            key_points=summary_data.get("key_points", []),
-            decisions=[Decision(**d) for d in summary_data.get("decisions", [])],
-            action_items=[ActionItem(**a) for a in summary_data.get("action_items", [])],
-            discussion_topics=summary_data.get("discussion_topics", []),
-            sentiment=summary_data.get("sentiment", "neutral"),
-            sentiment_score=summary_data.get("sentiment_score", 0.0),
+            executive_summary=(
+                summary_data.get("executive_summary") or 
+                summary_data.get("Executive Summary") or 
+                ""
+            ),
+            key_points=self._safe_list(
+                summary_data.get("key_points") or 
+                summary_data.get("Key Points") or 
+                []
+            ),
+            decisions=decisions,
+            action_items=action_items,
+            discussion_topics=self._safe_list(
+                summary_data.get("discussion_topics") or 
+                summary_data.get("Discussion Topics") or 
+                []
+            ),
+            sentiment=(
+                summary_data.get("sentiment") or 
+                summary_data.get("overall_sentiment") or
+                summary_data.get("Overall Sentiment") or 
+                "neutral"
+            ).lower(),
+            sentiment_score=float(summary_data.get("sentiment_score") or summary_data.get("Sentiment Score") or 0.0),
         )
         
-        logger.info("Summary generated successfully")
+        logger.info(f"Summary parsed successfully: {len(decisions)} decisions, {len(action_items)} action items")
         return summary
     
     async def analyze_sentiment(
