@@ -2,6 +2,8 @@
 Background Tasks for Meeting Processing
 """
 import logging
+import re
+from difflib import SequenceMatcher
 from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
@@ -11,6 +13,7 @@ from app.services.ai.transcription import transcription_service
 from app.services.ai.nlp import nlp_service
 from app.services.integrations.slack import slack_service
 from app.services.mentions import detect_and_store_mentions
+from app.services.notifications import create_notification
 from app.core.meeting_operations import (
     get_or_create_notification_tracking,
     mark_notification_failed,
@@ -28,21 +31,31 @@ logger = logging.getLogger(__name__)
 def _match_user_by_name(users: List[User], owner_name: Optional[str]) -> Optional[User]:
     if not owner_name:
         return None
-    target = owner_name.strip().lower()
+    target = re.sub(r"[^a-z0-9]+", " ", owner_name.strip().lower()).strip()
     if not target:
         return None
+    best_user: Optional[User] = None
+    best_score = 0.0
     for user in users:
         aliases = {
-            str(user.full_name or "").strip().lower(),
-            str(user.username or "").strip().lower(),
-            str(user.email or "").split("@")[0].strip().lower(),
+            re.sub(r"[^a-z0-9]+", " ", str(user.full_name or "").strip().lower()).strip(),
+            re.sub(r"[^a-z0-9]+", " ", str(user.username or "").strip().lower()).strip(),
+            re.sub(r"[^a-z0-9]+", " ", str(user.email or "").split("@")[0].strip().lower()).strip(),
         }
         first_name = str(user.full_name or "").split()[0].strip().lower() if str(user.full_name or "").strip() else ""
         if first_name:
-            aliases.add(first_name)
+            aliases.add(re.sub(r"[^a-z0-9]+", " ", first_name).strip())
+        aliases = {alias for alias in aliases if alias}
         if target in aliases:
             return user
-    return None
+        for alias in aliases:
+            score = SequenceMatcher(None, target, alias).ratio()
+            if target in alias or alias in target:
+                score = max(score, 0.92)
+            if score > best_score:
+                best_score = score
+                best_user = user
+    return best_user if best_score >= 0.74 else None
 
 
 def _parse_due_date(value: Optional[str]):
@@ -116,6 +129,8 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                 recording_path,
                 enable_diarization=True,
             )
+            if not transcription.segments:
+                raise RuntimeError("Transcript is empty")
             
             # Save transcripts
             for idx, segment in enumerate(transcription.segments):
@@ -150,18 +165,24 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
             )
             
             meeting.summary = summary.executive_summary  # type: ignore
-            meeting.key_decisions = [d.dict() for d in summary.decisions]  # type: ignore
+            meeting.key_decisions = [d.model_dump() for d in summary.decisions]  # type: ignore
             meeting.discussion_topics = summary.discussion_topics  # type: ignore
             meeting.sentiment_score = summary.sentiment_score  # type: ignore
 
-            candidate_users = db.execute(select(User).where(User.is_active.is_(True))).scalars().all()
+            candidate_users = db.execute(
+                select(User).where(
+                    User.is_active.is_(True),
+                    User.organization_id == meeting.organization_id,
+                )
+            ).scalars().all()
             
             # Save action items
             for action_data in summary.action_items:
                 owner = _match_user_by_name(candidate_users, action_data.owner)
                 action = ActionItem(
+                    organization_id=meeting.organization_id,
                     meeting_id=meeting.id,
-                    owner_id=(owner.id if owner else meeting.organizer_id),
+                    assigned_to_user_id=(owner.id if owner else meeting.organizer_id),
                     title=action_data.title,
                     description=action_data.description,
                     priority=action_data.priority,
@@ -175,6 +196,20 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                     },
                 )
                 db.add(action)
+                db.flush()
+                if action.assigned_to_user_id:
+                    create_notification(
+                        db,
+                        user_id=action.assigned_to_user_id,
+                        organization_id=meeting.organization_id,
+                        notification_type="task_assigned",
+                        message=f"You were assigned a task from {meeting.title}: {action.title}",
+                        notification_metadata={
+                            "action_item_id": str(action.id),
+                            "meeting_id": str(meeting.id),
+                            "source": "ai_processing",
+                        },
+                    )
 
             # Step 2.5: Save personalized mentions for present or absent users
             organizer = db.execute(
@@ -194,6 +229,7 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
             )
             
             meeting.analysis_status = "completed"  # type: ignore
+            meeting.transcription_status = "completed"  # type: ignore
             meeting.status = "completed"  # type: ignore
             db.commit()
 
@@ -291,6 +327,11 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                         failed_meeting.transcription_status = "failed"  # type: ignore
                         failed_meeting.analysis_status = "failed"  # type: ignore
                         failed_meeting.status = "failed"  # type: ignore
+                        failed_meeting.meeting_metadata = {
+                            **(failed_meeting.meeting_metadata or {}),
+                            "last_error": str(e),
+                            "failed_at": datetime.utcnow().isoformat(),
+                        }  # type: ignore
                         db.commit()
                 except Exception as status_error:
                     logger.error(

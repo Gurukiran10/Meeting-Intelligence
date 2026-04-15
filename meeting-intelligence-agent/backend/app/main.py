@@ -6,7 +6,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -15,10 +16,12 @@ from prometheus_client import make_asgi_app
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.database import init_db, close_db
-from app.core.redis import init_redis, close_redis
+from app.core.redis import init_redis, close_redis, redis_client
+from app.core.database import SessionLocal
 from app.api.v1.router import api_router
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIDMiddleware
@@ -153,7 +156,7 @@ app.add_middleware(RateLimitMiddleware)
 if not settings.DEBUG:
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["*.meetingintel.ai", "localhost"]
+        allowed_hosts=settings.TRUSTED_HOSTS
     )
 
 # Include API routers
@@ -178,11 +181,53 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Health check endpoint"""
+    database_status = "connected"
+    redis_status = "disconnected"
+    try:
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+    except Exception as exc:
+        database_status = "error"
+        logger.warning(f"Health database check failed: {exc}")
+
+    try:
+        if redis_client is not None:
+            await redis_client.ping()
+            redis_status = "connected"
+    except Exception as exc:
+        redis_status = "error"
+        logger.warning(f"Health redis check failed: {exc}")
+
     return {
-        "status": "healthy",
-        "database": "connected",
-        "redis": "connected",
+        "status": "healthy" if database_status == "connected" else "degraded",
+        "database": database_status,
+        "redis": redis_status,
+        "environment": settings.APP_ENV,
     }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.detail,
+            "request_id": request.state.request_id if hasattr(request.state, "request_id") else None,
+        },
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Validation failed",
+            "errors": exc.errors(),
+            "request_id": request.state.request_id if hasattr(request.state, "request_id") else None,
+        },
+    )
 
 
 @app.exception_handler(Exception)

@@ -3,7 +3,6 @@ AI Services - NLP Analysis Service
 """
 import logging
 from typing import List, Dict, Optional, Any, Tuple
-import asyncio
 import json
 import re
 from pydantic import BaseModel
@@ -40,8 +39,15 @@ class MentionDetection(BaseModel):
     text: str
     context: str
     relevance_score: float
+    confidence: float = 0.0
     is_action_item: bool = False
     is_question: bool = False
+    sentiment: Optional[str] = None
+    sentiment_score: Optional[float] = None
+    detection_method: Optional[str] = None
+    matched_alias: Optional[str] = None
+    matched_keyword: Optional[str] = None
+    decision_signal: Optional[bool] = None
 
 
 class ActionItem(BaseModel):
@@ -71,6 +77,7 @@ class MeetingSummary(BaseModel):
     decisions: List[Decision]
     action_items: List[ActionItem]
     discussion_topics: List[str]
+    mentions: List[MentionDetection] = []
     sentiment: str  # positive, negative, neutral
     sentiment_score: float
 
@@ -310,8 +317,13 @@ class NLPService:
                         text=sentence,
                         context=context,
                         relevance_score=relevance_score,
+                        confidence=max(min(relevance_score / 100.0, 1.0), 0.0),
                         is_action_item=is_action_item,
                         is_question=is_question,
+                        detection_method="personalized_heuristic",
+                        matched_alias=metadata.get("matched_alias"),
+                        matched_keyword=metadata.get("matched_keyword"),
+                        decision_signal=metadata.get("decision_signal"),
                     )
                 )
 
@@ -567,6 +579,76 @@ Return a JSON array of action items.
         
         logger.info(f"Extracted {len(action_items)} action items")
         return action_items
+
+    async def generate_pre_meeting_guidance(
+        self,
+        meeting_context: Dict[str, Any],
+        user_context: Dict[str, Any],
+    ) -> Dict[str, List[str]]:
+        """Generate lightweight preparation guidance for a user's upcoming meeting."""
+        pending_tasks = user_context.get("pending_tasks") or []
+        relevant_mentions = user_context.get("relevant_mentions") or []
+
+        fallback_questions: List[str] = []
+        for task in pending_tasks[:3]:
+            title = str(task.get("title") or "").strip()
+            if title:
+                fallback_questions.append(f"What is the latest status on '{title}'?")
+
+        fallback_points: List[str] = []
+        if pending_tasks:
+            fallback_points.append("Be ready to give a short status update on your open tasks.")
+        if relevant_mentions:
+            fallback_points.append("Address recent mentions or questions that may come up again.")
+        if not fallback_points:
+            fallback_points.append("Review the agenda and be ready to contribute where your work intersects.")
+
+        if not self.anthropic_client and not self.grok_client and not self.groq_client:
+            return {
+                "expected_questions": fallback_questions[:5],
+                "suggested_points": fallback_points[:5],
+            }
+
+        meeting_title = str(meeting_context.get("title") or "").strip()
+        agenda = meeting_context.get("agenda") or ""
+        attendees = meeting_context.get("attendees") or []
+
+        prompt = f"""Generate a short pre-meeting preparation brief for one attendee.
+
+Meeting Title: {meeting_title}
+Agenda: {agenda}
+Attendees: {", ".join([str(attendee) for attendee in attendees[:10]])}
+
+User context:
+- Pending tasks: {json.dumps(pending_tasks[:5])}
+- Relevant mentions: {json.dumps(relevant_mentions[:5])}
+- Recent developments: {json.dumps((user_context.get("recent_developments") or [])[:5])}
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "expected_questions": ["..."],
+  "suggested_points": ["..."]
+}}
+
+Rules:
+- Keep it concise and practical.
+- Focus on likely questions this user should be ready to answer.
+- Suggested points should help the user contribute clearly in the meeting.
+- Maximum 5 items per list.
+"""
+
+        data = await self._generate_json(
+            system_prompt="You help users prepare for meetings with concise, structured guidance.",
+            user_prompt=prompt,
+            temperature=0.2,
+        )
+
+        expected_questions = self._safe_list(data.get("expected_questions"))[:5] or fallback_questions[:5]
+        suggested_points = self._safe_list(data.get("suggested_points"))[:5] or fallback_points[:5]
+        return {
+            "expected_questions": expected_questions,
+            "suggested_points": suggested_points,
+        }
     
     async def generate_summary(
         self,
@@ -591,6 +673,7 @@ Return a JSON array of action items.
                 decisions=[],
                 action_items=fallback_actions,
                 discussion_topics=[meeting_title],
+                mentions=[],
                 sentiment="neutral",
                 sentiment_score=0.0,
             )
@@ -609,8 +692,9 @@ Provide:
 3. Decisions Made: What was decided, why, alternatives considered, who decided, is it reversible, impact level
 4. Action Items: Tasks, owners, deadlines, priorities
 5. Discussion Topics: Main themes discussed
-6. Overall Sentiment: positive, negative, or neutral
-7. Sentiment Score: -1 (very negative) to +1 (very positive)
+6. Mentions: important people referenced, with mention type, text, context, relevance score, and confidence
+7. Overall Sentiment: positive, negative, or neutral
+8. Sentiment Score: -1 (very negative) to +1 (very positive)
 
 Be concise but comprehensive. Focus on actionable information.
 
@@ -641,6 +725,7 @@ Return a JSON object.
                 decisions=[],
                 action_items=fallback_actions,
                 discussion_topics=[meeting_title],
+                mentions=[],
                 sentiment="neutral",
                 sentiment_score=0.0,
             )
@@ -689,6 +774,34 @@ Return a JSON object.
                     action_items.append(ActionItem(**self._normalize_action_item(a)))
                 except Exception as e:
                     logger.warning(f"Failed to parse action item: {e}")
+
+        mention_items_data = summary_data.get("mentions") or summary_data.get("Mentions") or []
+        if isinstance(mention_items_data, dict):
+            mention_items_data = list(mention_items_data.values()) if mention_items_data else []
+        elif not isinstance(mention_items_data, list):
+            mention_items_data = []
+
+        mentions: List[MentionDetection] = []
+        for mention_dict in mention_items_data:
+            if isinstance(mention_dict, dict):
+                try:
+                    mentions.append(
+                        MentionDetection(
+                            user_name=str(mention_dict.get("user_name") or mention_dict.get("name") or mention_dict.get("user") or "").strip(),
+                            mention_type=str(mention_dict.get("mention_type") or mention_dict.get("type") or "direct").strip(),
+                            text=str(mention_dict.get("text") or mention_dict.get("mentioned_text") or "").strip(),
+                            context=str(mention_dict.get("context") or mention_dict.get("full_context") or "").strip(),
+                            relevance_score=float(mention_dict.get("relevance_score") or mention_dict.get("score") or 0.0),
+                            confidence=float(mention_dict.get("confidence") or 0.0),
+                            is_action_item=bool(mention_dict.get("is_action_item", False)),
+                            is_question=bool(mention_dict.get("is_question", False)),
+                            sentiment=mention_dict.get("sentiment"),
+                            sentiment_score=mention_dict.get("sentiment_score"),
+                            detection_method=mention_dict.get("detection_method"),
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to parse mention summary item: {e}")
         
         summary = MeetingSummary(
             executive_summary=(
@@ -708,6 +821,7 @@ Return a JSON object.
                 summary_data.get("Discussion Topics") or 
                 []
             ),
+            mentions=mentions,
             sentiment=(
                 summary_data.get("sentiment") or 
                 summary_data.get("overall_sentiment") or
@@ -717,7 +831,9 @@ Return a JSON object.
             sentiment_score=float(summary_data.get("sentiment_score") or summary_data.get("Sentiment Score") or 0.0),
         )
         
-        logger.info(f"Summary parsed successfully: {len(decisions)} decisions, {len(action_items)} action items")
+        logger.info(
+            f"Summary parsed successfully: {len(decisions)} decisions, {len(action_items)} action items, {len(mentions)} mentions"
+        )
         return summary
     
     async def analyze_sentiment(

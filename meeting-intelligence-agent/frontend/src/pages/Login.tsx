@@ -1,20 +1,33 @@
 import React, { useState } from 'react'
 import { Navigate } from 'react-router-dom'
+import { useQuery } from 'react-query'
 import { api } from '../lib/api'
-import { isAuthenticated, setTokens } from '../lib/auth'
+import { clearTokens } from '../lib/auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { AlertCircle, Lock, User, Eye, EyeOff } from 'lucide-react'
 
 const Login: React.FC = () => {
-  const [username, setUsername] = useState('admin')
-  const [password, setPassword] = useState('admin123')
+  const [mode, setMode] = useState<'login' | 'signup'>('login')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [email, setEmail] = useState('')
+  const [fullName, setFullName] = useState('')
+  const [organizationName, setOrganizationName] = useState('')
+  const [organizationSlug, setOrganizationSlug] = useState('')
+  const [createOrganization, setCreateOrganization] = useState(true)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [showPassword, setShowPassword] = useState(false)
 
-  if (isAuthenticated()) {
+  const { data: sessionUser } = useQuery(
+    'login-session',
+    async () => (await api.get('/api/v1/auth/me')).data,
+    { retry: false, refetchOnWindowFocus: false },
+  )
+
+  if (sessionUser) {
     return <Navigate to="/dashboard" replace />
   }
 
@@ -24,19 +37,30 @@ const Login: React.FC = () => {
     setError('')
 
     try {
-      const params = new URLSearchParams()
-      params.append('username', username)
-      params.append('password', password)
+      if (mode === 'login') {
+        const params = new URLSearchParams()
+        params.append('username', username)
+        params.append('password', password)
+        await api.post('/api/v1/auth/login', params, {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        })
+      } else {
+        await api.post('/api/v1/auth/signup', {
+          email,
+          username,
+          full_name: fullName,
+          password,
+          create_organization: createOrganization,
+          organization_name: createOrganization ? organizationName : undefined,
+          organization_slug: organizationSlug || undefined,
+        })
+      }
 
-      const response = await api.post('/api/v1/auth/login', params, {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-      })
-
-      setTokens(response.data.access_token, response.data.refresh_token)
       window.location.href = '/dashboard'
     } catch (e: any) {
+      clearTokens()
       const detail = e?.response?.data?.detail
       if (detail) {
         setError(String(detail))
@@ -64,11 +88,32 @@ const Login: React.FC = () => {
           </div>
           <CardTitle className="text-2xl font-bold tracking-tight">SyncMinds Login</CardTitle>
           <CardDescription>
-            Enter your credentials to access your meeting intelligence
+            {mode === 'login' ? 'Sign in to your organization workspace' : 'Create your account and organization'}
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleLogin} className="space-y-4">
+            {mode === 'signup' && (
+              <>
+                <div className="space-y-2">
+                  <Input
+                    placeholder="Full name"
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    required
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Input
+                    type="email"
+                    placeholder="Email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    required
+                  />
+                </div>
+              </>
+            )}
             <div className="space-y-2">
               <div className="relative">
                 <User className="absolute left-3 top-3 h-4 w-4 text-slate-400" />
@@ -102,6 +147,33 @@ const Login: React.FC = () => {
                 </button>
               </div>
             </div>
+            {mode === 'signup' && (
+              <>
+                <div className="flex items-center justify-between rounded-md border border-slate-200 px-3 py-2 text-sm">
+                  <label className="font-medium text-slate-700">Create a new organization</label>
+                  <input
+                    type="checkbox"
+                    checked={createOrganization}
+                    onChange={(e) => setCreateOrganization(e.target.checked)}
+                  />
+                </div>
+                {createOrganization ? (
+                  <Input
+                    placeholder="Organization name"
+                    value={organizationName}
+                    onChange={(e) => setOrganizationName(e.target.value)}
+                    required
+                  />
+                ) : (
+                  <Input
+                    placeholder="Organization slug to join"
+                    value={organizationSlug}
+                    onChange={(e) => setOrganizationSlug(e.target.value)}
+                    required
+                  />
+                )}
+              </>
+            )}
 
             {error && (
               <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-md flex items-center text-sm">
@@ -121,9 +193,19 @@ const Login: React.FC = () => {
                   Signing in...
                 </div>
               ) : (
-                'Sign in'
+                mode === 'login' ? 'Sign in' : 'Create account'
               )}
             </Button>
+            <button
+              type="button"
+              className="w-full text-sm text-blue-600 hover:text-blue-700"
+              onClick={() => {
+                setMode((current) => (current === 'login' ? 'signup' : 'login'))
+                setError('')
+              }}
+            >
+              {mode === 'login' ? 'Need an account? Sign up' : 'Already have an account? Sign in'}
+            </button>
           </form>
         </CardContent>
         <CardFooter className="flex flex-col space-y-4">

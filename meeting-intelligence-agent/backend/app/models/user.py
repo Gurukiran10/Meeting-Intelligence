@@ -2,7 +2,7 @@
 User Model
 """
 from datetime import datetime
-from sqlalchemy import Column, String, Boolean, DateTime, JSON, Integer
+from sqlalchemy import Column, String, Boolean, DateTime, JSON, Integer, ForeignKey
 from sqlalchemy.orm import relationship
 import uuid
 
@@ -15,6 +15,7 @@ class User(Base):
     __tablename__ = "users"
     
     id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(GUID(), ForeignKey("organizations.id"), nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
     username = Column(String(100), unique=True, nullable=False, index=True)
     full_name = Column(String(255), nullable=False)
@@ -23,7 +24,7 @@ class User(Base):
     # Profile
     avatar_url = Column(String(500))
     timezone = Column(String(50), default="UTC")
-    role = Column(String(50), default="user")  # user, admin, manager
+    role = Column(String(50), default="member")  # admin, member
     department = Column(String(100))
     job_title = Column(String(100))
     
@@ -54,6 +55,8 @@ class User(Base):
     last_login = Column(DateTime)
     
     # Relationships
+    organization = relationship("Organization", back_populates="users")
     meetings = relationship("Meeting", back_populates="organizer", foreign_keys="Meeting.organizer_id")
-    action_items = relationship("ActionItem", back_populates="owner", foreign_keys="ActionItem.owner_id")
+    action_items = relationship("ActionItem", back_populates="assigned_to_user", foreign_keys="ActionItem.assigned_to_user_id")
     mentions = relationship("Mention", back_populates="user")
+    notifications = relationship("Notification", back_populates="user")

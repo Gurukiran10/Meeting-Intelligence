@@ -3,7 +3,7 @@ Action Item Model
 """
 from datetime import datetime, timedelta
 from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, Integer, Float, JSON
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, synonym
 import uuid
 
 from app.core.database import Base
@@ -15,6 +15,7 @@ class ActionItem(Base):
     __tablename__ = "action_items"
     
     id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(GUID(), ForeignKey("organizations.id"), nullable=False, index=True)
     meeting_id = Column(GUID(), ForeignKey("meetings.id"), nullable=False, index=True)
     
     # Content
@@ -23,7 +24,8 @@ class ActionItem(Base):
     context = Column(Text)  # Surrounding conversation
     
     # Assignment
-    owner_id = Column(GUID(), ForeignKey("users.id"), index=True)
+    assigned_to_user_id = Column(GUID(), ForeignKey("users.id"), index=True)
+    owner_id = synonym("assigned_to_user_id")
     collaborator_ids = Column(JSON, default=[])  # List of UUID strings
     
     # Status
@@ -70,9 +72,18 @@ class ActionItem(Base):
     deleted_at = Column(DateTime)
     
     # Relationships
+    organization = relationship("Organization", back_populates="action_items")
     meeting = relationship("Meeting", back_populates="action_items")
-    owner = relationship("User", back_populates="action_items", foreign_keys=[owner_id])
+    assigned_to_user = relationship("User", back_populates="action_items", foreign_keys=[assigned_to_user_id])
     updates = relationship("ActionItemUpdate", back_populates="action_item", cascade="all, delete-orphan")
+
+    @property
+    def owner(self):
+        return self.assigned_to_user
+
+    @owner.setter
+    def owner(self, value):
+        self.assigned_to_user = value
 
 
 class ActionItemUpdate(Base):

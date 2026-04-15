@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, or_, cast, String
 from sqlalchemy.orm import Session
 
-from app.api.v1.endpoints.auth import get_current_user
+from app.api.v1.endpoints.auth import require_org_member, require_admin
 from app.core.database import get_db
 from app.models.action_item import ActionItem
 from app.models.meeting import Meeting
@@ -67,7 +67,7 @@ class MeetingEfficiencyResponse(BaseModel):
 
 @router.get("/dashboard", response_model=AnalyticsDashboard)
 async def get_analytics_dashboard(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Get analytics dashboard data from real database values"""
@@ -76,11 +76,19 @@ async def get_analytics_dashboard(
     month_ago = now - timedelta(days=30)
 
     meeting_query = select(Meeting).where(
-        or_(
-            Meeting.organizer_id == current_user.id,
-            cast(Meeting.attendee_ids, String).contains(str(current_user.id)),
-        )
+        Meeting.organization_id == current_user.organization_id,
+        Meeting.deleted_at.is_(None),
     )
+    if current_user.role != "admin":
+        meeting_query = meeting_query.where(
+            or_(
+                Meeting.organizer_id == current_user.id,
+                Meeting.created_by == current_user.id,
+                cast(Meeting.attendee_ids, String).contains(str(current_user.id)),
+                cast(Meeting.attendee_ids, String).contains(current_user.email),
+                cast(Meeting.attendee_ids, String).contains(current_user.username),
+            )
+        )
     meetings = db.execute(meeting_query).scalars().all()
 
     total_meetings = len(meetings)
@@ -108,8 +116,10 @@ async def get_analytics_dashboard(
     decision_velocity = (total_decisions / total_hours) if total_hours > 0 else 0.0
 
     action_query = select(ActionItem).where(
-        ActionItem.owner_id == current_user.id
+        ActionItem.organization_id == current_user.organization_id
     )
+    if current_user.role != "admin":
+        action_query = action_query.where(ActionItem.assigned_to_user_id == current_user.id)
     action_items = db.execute(action_query).scalars().all()
 
     total_actions = len(action_items)
@@ -146,22 +156,31 @@ async def get_analytics_dashboard(
 
 @router.get("/meeting-efficiency")
 async def get_meeting_efficiency(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Get real meeting efficiency metrics"""
     meetings = db.execute(
         select(Meeting).where(
-            or_(
-                Meeting.organizer_id == current_user.id,
-                cast(Meeting.attendee_ids, String).contains(str(current_user.id)),
-            )
+            Meeting.organization_id == current_user.organization_id,
+            Meeting.deleted_at.is_(None),
         )
     ).scalars().all()
+    if current_user.role != "admin":
+        meetings = [
+            meeting for meeting in meetings
+            if meeting.organizer_id == current_user.id
+            or meeting.created_by == current_user.id
+            or str(current_user.id) in str(meeting.attendee_ids or [])
+            or current_user.email in str(meeting.attendee_ids or [])
+            or current_user.username in str(meeting.attendee_ids or [])
+        ]
 
     action_items = db.execute(
-        select(ActionItem).where(ActionItem.owner_id == current_user.id)
+        select(ActionItem).where(ActionItem.organization_id == current_user.organization_id)
     ).scalars().all()
+    if current_user.role != "admin":
+        action_items = [item for item in action_items if item.assigned_to_user_id == current_user.id]
 
     total_minutes = 0.0
     total_decisions = 0
@@ -228,7 +247,7 @@ async def get_meeting_efficiency(
 
 @router.get("/intelligence-report", response_model=Dict[str, Any])
 async def get_intelligence_report(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Return full meeting intelligence report: personal insights, team insights, recommendations."""
@@ -237,7 +256,7 @@ async def get_intelligence_report(
 
 @router.get("/personal-insights", response_model=Dict[str, Any])
 async def get_personal_insights(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Return personal meeting insights: time breakdown, action completion, speaking time, load trends."""
@@ -247,7 +266,7 @@ async def get_personal_insights(
 
 @router.get("/team-insights", response_model=Dict[str, Any])
 async def get_team_insights(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Return team meeting insights: efficiency, follow-through rates, low-value recurring meetings."""
@@ -257,7 +276,7 @@ async def get_team_insights(
 
 @router.get("/recommendations", response_model=List[str])
 async def get_recommendations(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Return AI-generated meeting improvement recommendations."""

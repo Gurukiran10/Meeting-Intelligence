@@ -43,22 +43,6 @@ class TranscriptionService:
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=2)
 
-    def _build_fallback_result(self, audio_path: str) -> TranscriptionResult:
-        fallback_text = self._fallback_text_from_file(audio_path)
-        return TranscriptionResult(
-            segments=[
-                TranscriptionSegment(
-                    start=0.0,
-                    end=30.0,
-                    text=fallback_text,
-                    speaker="speaker_0",
-                    confidence=0.5,
-                )
-            ],
-            language="en",
-            duration=30.0,
-        )
-    
     async def transcribe_audio(
         self,
         audio_path: str,
@@ -75,18 +59,12 @@ class TranscriptionService:
 
         api_key = settings.GROQ_API_KEY or settings.GROK_API_KEY
         if not GROQ_AVAILABLE:
-            logger.warning("Groq SDK not installed, using fallback transcription")
-            return self._build_fallback_result(audio_path)
+            raise RuntimeError("Groq SDK is not installed. Install the Groq client to enable transcription.")
 
         if not api_key:
-            logger.warning("No GROQ_API_KEY/GROK_API_KEY configured, using fallback transcription")
-            return self._build_fallback_result(audio_path)
+            raise RuntimeError("No GROQ_API_KEY or GROK_API_KEY configured for transcription.")
 
-        try:
-            return await self._transcribe_with_groq(audio_path, api_key)
-        except Exception as exc:
-            logger.warning(f"API transcription failed; using fallback transcript: {exc}")
-            return self._build_fallback_result(audio_path)
+        return await self._transcribe_with_groq(audio_path, api_key)
 
     async def _transcribe_with_groq(self, audio_path: str, api_key: str) -> TranscriptionResult:
         """Transcribe using Groq's Whisper API — very fast cloud transcription."""
@@ -126,22 +104,6 @@ class TranscriptionService:
         logger.info(f"Groq transcription completed: {len(segments)} segments")
         return TranscriptionResult(segments=segments, language=language, duration=duration)
 
-    def _fallback_text_from_file(self, audio_path: str) -> str:
-        """Generate fallback transcript text from upload when AI libs are unavailable"""
-        path = Path(audio_path)
-        if path.suffix.lower() == ".txt":
-            try:
-                content = path.read_text(encoding="utf-8").strip()
-                if content:
-                    return content[:4000]
-            except Exception as exc:
-                logger.warning(f"Failed to read txt upload for fallback transcript: {exc}")
-
-        return (
-            "Transcription unavailable. Configure GROQ_API_KEY (or GROK_API_KEY alias) "
-            "for API-based transcription."
-        )
-    
     async def extract_audio_from_video(
         self,
         video_path: str,

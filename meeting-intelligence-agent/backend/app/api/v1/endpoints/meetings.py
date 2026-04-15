@@ -1,22 +1,80 @@
 """
 Meetings API Endpoints
 """
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc, cast, String
-from pydantic import BaseModel
+from sqlalchemy import select, desc, cast, String, or_
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 from app.core.database import get_db
 from app.models.meeting import Meeting
 from app.models.user import User
-from app.api.v1.endpoints.auth import get_current_user
+from app.api.v1.endpoints.auth import get_current_user, require_org_member
 from app.tasks.meeting_processor import process_meeting_recording_background
 from app.services.absence_management import absence_management_service
+from app.services.pre_meeting_briefs import pre_meeting_brief_service
 
 router = APIRouter()
+
+
+def _resolve_attendee_ids(db: Session, attendee_inputs: List[str]) -> List[str]:
+    resolved: List[str] = []
+    seen: set[str] = set()
+
+    for raw_value in attendee_inputs:
+        value = raw_value.strip()
+        if not value:
+            continue
+
+        normalized_value = value
+        try:
+            normalized_value = str(UUID(value))
+        except ValueError:
+            user = db.execute(
+                select(User).where(
+                    or_(
+                        User.email.ilike(value),
+                        User.username.ilike(value),
+                    )
+                )
+            ).scalar_one_or_none()
+            if user is not None:
+                normalized_value = str(user.id)
+
+        if normalized_value not in seen:
+            seen.add(normalized_value)
+            resolved.append(normalized_value)
+
+    return resolved
+
+
+def _user_attendee_tokens(user: User) -> List[str]:
+    tokens = [
+        str(getattr(user, "id", "") or "").strip(),
+        str(getattr(user, "email", "") or "").strip(),
+        str(getattr(user, "username", "") or "").strip(),
+    ]
+    return [token for token in tokens if token]
+
+
+def _is_admin(user: User) -> bool:
+    return str(getattr(user, "role", "") or "").lower() == "admin"
+
+
+def _can_access_meeting(user: User, meeting: Meeting) -> bool:
+    if str(getattr(meeting, "organization_id", "") or "") != str(getattr(user, "organization_id", "") or ""):
+        return False
+    if _is_admin(user):
+        return True
+    attendee_tokens = set(_user_attendee_tokens(user))
+    return (
+        meeting.organizer_id == user.id
+        or getattr(meeting, "created_by", None) == getattr(user, "id", None)
+        or bool(attendee_tokens.intersection(set(meeting.attendee_ids or [])))
+    )
 
 
 class MeetingCreate(BaseModel):
@@ -26,12 +84,72 @@ class MeetingCreate(BaseModel):
     platform: str = "manual"
     scheduled_start: datetime
     scheduled_end: datetime
-    attendee_ids: List[str] = []
-    agenda: Optional[dict] = None
-    tags: List[str] = []
+    attendee_ids: List[str] = Field(default_factory=list)
+    agenda: Optional[Union[List[str], Dict[str, Any]]] = None
+    tags: List[str] = Field(default_factory=list)
+
+    @field_validator("platform")
+    @classmethod
+    def validate_platform(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"zoom", "manual"}:
+            raise ValueError("Platform must be either 'zoom' or 'manual'")
+        return normalized
+
+    @field_validator("attendee_ids", mode="before")
+    @classmethod
+    def normalize_attendees(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("attendee_ids must be a list")
+
+        normalized: List[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    @field_validator("agenda", mode="before")
+    @classmethod
+    def normalize_agenda(cls, value: Any) -> Optional[Union[List[str], Dict[str, Any]]]:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            topics = [str(item).strip() for item in value if str(item).strip()]
+            return topics or None
+        if isinstance(value, dict):
+            return value
+        raise ValueError("agenda must be a list of topics or an object")
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def normalize_tags(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("tags must be a list")
+
+        normalized: List[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    @field_validator("scheduled_end")
+    @classmethod
+    def validate_schedule(cls, value: datetime, info: Any) -> datetime:
+        start = info.data.get("scheduled_start")
+        if start and value <= start:
+            raise ValueError("scheduled_end must be after scheduled_start")
+        return value
 
 
 class MeetingResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     title: str
     description: Optional[str]
@@ -43,10 +161,12 @@ class MeetingResponse(BaseModel):
     actual_end: Optional[datetime]
     status: str
     summary: Optional[str]
+    created_by: Optional[UUID] = None
+    attendee_ids: Optional[List[str]] = None
+    attendee_count: Optional[int] = 0
+    agenda: Optional[Union[List[str], Dict[str, Any]]]
+    tags: Optional[List[str]] = None
     created_at: datetime
-    
-    class Config:
-        from_attributes = True
 
 
 class MeetingDetail(MeetingResponse):
@@ -59,22 +179,73 @@ class MeetingDetail(MeetingResponse):
     meeting_quality_score: Optional[float]
 
 
+class PreBriefMeetingContext(BaseModel):
+    title: str
+    agenda: str
+    attendees: List[str]
+
+
+class PreBriefTask(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    status: str
+    priority: Optional[str] = None
+    due_date: Optional[str] = None
+    meeting_id: Optional[str] = None
+
+
+class PreBriefMention(BaseModel):
+    id: str
+    meeting_id: str
+    text: str
+    type: str
+    confidence: Optional[float] = None
+    created_at: Optional[str] = None
+
+
+class PreBriefPreparation(BaseModel):
+    pending_tasks: List[PreBriefTask]
+    relevant_mentions: List[PreBriefMention]
+    expected_questions: List[str]
+
+
+class PreBriefDevelopment(BaseModel):
+    type: str
+    title: str
+    summary: str
+    scheduled_start: Optional[str] = None
+
+
+class PreMeetingBriefResponse(BaseModel):
+    meeting_context: PreBriefMeetingContext
+    user_preparation: PreBriefPreparation
+    recent_developments: List[PreBriefDevelopment]
+    suggested_points: List[str]
+    importance: str
+
+
 @router.post("/", response_model=MeetingResponse, status_code=status.HTTP_201_CREATED)
 async def create_meeting(
     meeting_data: MeetingCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Create new meeting"""
+    attendee_ids = _resolve_attendee_ids(db, meeting_data.attendee_ids)
+
     meeting = Meeting(
         title=meeting_data.title,
         description=meeting_data.description,
         meeting_type=meeting_data.meeting_type,
         platform=meeting_data.platform,
+        organization_id=current_user.organization_id,
+        created_by=current_user.id,
         scheduled_start=meeting_data.scheduled_start,
         scheduled_end=meeting_data.scheduled_end,
         organizer_id=current_user.id,
-        attendee_ids=meeting_data.attendee_ids,
+        attendee_ids=attendee_ids,
+        attendee_count=len(attendee_ids),
         agenda=meeting_data.agenda,
         tags=meeting_data.tags,
         status="scheduled",
@@ -92,14 +263,25 @@ async def list_meetings(
     skip: int = 0,
     limit: int = 50,
     status: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """List user meetings"""
     query = select(Meeting).where(
-        (Meeting.organizer_id == current_user.id) |
-        (cast(Meeting.attendee_ids, String).contains(str(current_user.id)))
-    ).where(Meeting.deleted_at.is_(None))
+        Meeting.organization_id == current_user.organization_id,
+        Meeting.deleted_at.is_(None),
+    )
+
+    if not _is_admin(current_user):
+        attendee_filters = [
+            cast(Meeting.attendee_ids, String).contains(token)
+            for token in _user_attendee_tokens(current_user)
+        ]
+        query = query.where(
+            (Meeting.organizer_id == current_user.id) |
+            (Meeting.created_by == current_user.id) |
+            or_(*attendee_filters)
+        )
     
     if status:
         query = query.where(Meeting.status == status)
@@ -115,7 +297,7 @@ async def list_meetings(
 @router.get("/{meeting_id}", response_model=MeetingDetail)
 async def get_meeting(
     meeting_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Get meeting details"""
@@ -131,10 +313,8 @@ async def get_meeting(
         )
     
     # Check access - user must be organizer or attendee
-    if (
-        meeting.organizer_id != current_user.id
-        and str(current_user.id) not in (meeting.attendee_ids or [])
-    ):  # type: ignore
+    attendee_tokens = set(_user_attendee_tokens(current_user))
+    if not _can_access_meeting(current_user, meeting):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -147,7 +327,7 @@ async def get_meeting(
 async def upload_recording(
     meeting_id: UUID,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
     file: UploadFile = File(...),
 ):
@@ -162,6 +342,9 @@ async def upload_recording(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Meeting not found",
         )
+
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     
     # Save file
     import os
@@ -174,7 +357,7 @@ async def upload_recording(
     
     # Update meeting
     meeting.recording_path = file_path  # type: ignore
-    meeting.status = "transcribing"  # type: ignore
+    meeting.status = "processing"  # type: ignore
     meeting.transcription_status = "processing"  # type: ignore
     
     db.commit()
@@ -188,7 +371,7 @@ async def upload_recording(
 @router.delete("/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_meeting(
     meeting_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Delete meeting (soft delete)"""
@@ -203,7 +386,13 @@ async def delete_meeting(
             detail="Meeting not found",
         )
     
-    if meeting.organizer_id != current_user.id:  # type: ignore
+    if str(getattr(meeting, "organization_id", "") or "") != str(getattr(current_user, "organization_id", "") or ""):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+    if not _is_admin(current_user) and meeting.organizer_id != current_user.id:  # type: ignore
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only organizer can delete meeting",
@@ -218,7 +407,7 @@ async def delete_meeting(
 @router.get("/{meeting_id}/catchup", response_model=Dict[str, Any])
 async def get_meeting_catchup(
     meeting_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Generate a catch-up package for the current user for a meeting they missed."""
@@ -226,20 +415,43 @@ async def get_meeting_catchup(
     if not meeting:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
 
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
     catchup = await absence_management_service.generate_catchup_for_user(db, meeting, current_user)
     return catchup
+
+
+@router.get("/{meeting_id}/pre-brief", response_model=PreMeetingBriefResponse)
+async def get_pre_meeting_brief(
+    meeting_id: UUID,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Return a personalized pre-meeting intelligence brief for the current user."""
+    meeting = db.execute(select(Meeting).where(Meeting.id == meeting_id)).scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    return await pre_meeting_brief_service.generate_api_brief_for_user(db, meeting, current_user)
 
 
 @router.post("/{meeting_id}/catchup/send", response_model=Dict[str, Any])
 async def send_meeting_catchup(
     meeting_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Send a catch-up Slack DM to the current user for a meeting they missed."""
     meeting = db.execute(select(Meeting).where(Meeting.id == meeting_id)).scalar_one_or_none()
     if not meeting:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     success = await absence_management_service.send_catchup_to_user(db, meeting, current_user)
     return {"sent": success, "meeting_id": str(meeting_id), "user_id": str(getattr(current_user, "id", ""))}
@@ -248,7 +460,7 @@ async def send_meeting_catchup(
 @router.get("/{meeting_id}/absentees", response_model=List[Dict[str, Any]])
 async def get_meeting_absentees(
     meeting_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Get list of users who were invited but did not attend the meeting."""
@@ -256,7 +468,10 @@ async def get_meeting_absentees(
     if not meeting:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
 
-    if getattr(meeting, "organizer_id", None) != getattr(current_user, "id", None):
+    if str(getattr(meeting, "organization_id", "") or "") != str(getattr(current_user, "organization_id", "") or ""):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    if not _is_admin(current_user) and getattr(meeting, "organizer_id", None) != getattr(current_user, "id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the organizer can view absentees")
 
     absentees = absence_management_service.find_absentees_for_meeting(db, meeting)

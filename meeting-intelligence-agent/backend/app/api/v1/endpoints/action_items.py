@@ -5,13 +5,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import select, or_, case, cast, String
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.core.database import get_db
 from app.models.action_item import ActionItem
 from app.models.meeting import Meeting
 from app.models.user import User
-from app.api.v1.endpoints.auth import get_current_user
+from app.api.v1.endpoints.auth import require_org_member
+from app.services.notifications import create_notification
 
 router = APIRouter()
 
@@ -20,7 +21,7 @@ class ActionItemCreate(BaseModel):
     title: str
     description: Optional[str] = None
     meeting_id: UUID
-    owner_id: Optional[UUID] = None
+    assigned_to_user_id: Optional[UUID] = None
     due_date: Optional[datetime] = None
     priority: str = "medium"
     category: Optional[str] = None
@@ -31,7 +32,7 @@ class ActionItemUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     status: Optional[str] = None
-    owner_id: Optional[UUID] = None
+    assigned_to_user_id: Optional[UUID] = None
     due_date: Optional[datetime] = None
     priority: Optional[str] = None
 
@@ -42,7 +43,7 @@ class ActionItemResponse(BaseModel):
     description: Optional[str]
     meeting_id: UUID
     category: Optional[str]
-    owner_id: Optional[UUID]
+    assigned_to_user_id: Optional[UUID]
     status: str
     priority: str
     due_date: Optional[datetime]
@@ -50,20 +51,23 @@ class ActionItemResponse(BaseModel):
     extraction_method: Optional[str]
     created_at: datetime
     
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 @router.post("/", response_model=ActionItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_action_item(
     item_data: ActionItemCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Create new action item"""
     # Ensure the meeting exists and user has access to it
     meeting_result = db.execute(
-        select(Meeting).where(Meeting.id == item_data.meeting_id)
+        select(Meeting).where(
+            Meeting.id == item_data.meeting_id,
+            Meeting.organization_id == current_user.organization_id,
+            Meeting.deleted_at.is_(None),
+        )
     )
     meeting = meeting_result.scalar_one_or_none()
 
@@ -73,7 +77,7 @@ async def create_action_item(
             detail="Meeting not found",
         )
 
-    if (
+    if current_user.role != "admin" and (
         meeting.organizer_id != current_user.id
         and str(current_user.id) not in (meeting.attendee_ids or [])
     ):
@@ -82,15 +86,38 @@ async def create_action_item(
             detail="Access denied for this meeting",
         )
 
-    owner_id = item_data.owner_id or current_user.id
+    assigned_to_user_id = item_data.assigned_to_user_id or current_user.id
+
+    if assigned_to_user_id:
+        assigned_user = db.execute(
+            select(User).where(
+                User.id == assigned_to_user_id,
+                User.organization_id == current_user.organization_id,
+            )
+        ).scalar_one_or_none()
+        if not assigned_user:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Assigned user must belong to your organization")
 
     action_item = ActionItem(
-        **item_data.model_dump(exclude={"owner_id"}),
-        owner_id=owner_id,
+        **item_data.model_dump(exclude={"assigned_to_user_id"}),
+        organization_id=current_user.organization_id,
+        assigned_to_user_id=assigned_to_user_id,
         extraction_method="manual",
     )
     
     db.add(action_item)
+    if assigned_to_user_id and assigned_to_user_id != current_user.id:
+        create_notification(
+            db,
+            user_id=assigned_to_user_id,
+            organization_id=current_user.organization_id,
+            notification_type="task_assigned",
+            message=f"You were assigned a task: {action_item.title}",
+            notification_metadata={
+                "action_item_id": str(action_item.id),
+                "meeting_id": str(action_item.meeting_id),
+            },
+        )
     db.commit()
     db.refresh(action_item)
 
@@ -141,16 +168,20 @@ async def list_action_items(
     limit: int = 100,
     status: Optional[str] = None,
     priority: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """List user's action items"""
     query = select(ActionItem).filter(
         or_(
-            ActionItem.owner_id == current_user.id,
+            ActionItem.assigned_to_user_id == current_user.id,
             cast(ActionItem.collaborator_ids, String).contains(str(current_user.id)),
         )
     )
+    query = query.where(ActionItem.organization_id == current_user.organization_id)
+
+    if current_user.role == "admin":
+        query = select(ActionItem).where(ActionItem.organization_id == current_user.organization_id)
     
     if status:
         query = query.where(ActionItem.status == status)
@@ -173,12 +204,15 @@ async def list_action_items(
 @router.get("/{item_id}", response_model=ActionItemResponse)
 async def get_action_item(
     item_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Get action item details"""
     result = db.execute(
-        select(ActionItem).where(ActionItem.id == item_id)
+        select(ActionItem).where(
+            ActionItem.id == item_id,
+            ActionItem.organization_id == current_user.organization_id,
+        )
     )
     item = result.scalar_one_or_none()
     
@@ -189,7 +223,8 @@ async def get_action_item(
         )
 
     if (
-        item.owner_id != current_user.id
+        current_user.role != "admin"
+        and item.assigned_to_user_id != current_user.id
         and str(current_user.id) not in (item.collaborator_ids or [])
     ):
         raise HTTPException(
@@ -204,12 +239,15 @@ async def get_action_item(
 async def update_action_item(
     item_id: UUID,
     update_data: ActionItemUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Update action item"""
     result = db.execute(
-        select(ActionItem).where(ActionItem.id == item_id)
+        select(ActionItem).where(
+            ActionItem.id == item_id,
+            ActionItem.organization_id == current_user.organization_id,
+        )
     )
     item = result.scalar_one_or_none()
     
@@ -220,7 +258,8 @@ async def update_action_item(
         )
 
     if (
-        item.owner_id != current_user.id
+        current_user.role != "admin"
+        and item.assigned_to_user_id != current_user.id
         and str(current_user.id) not in (item.collaborator_ids or [])
     ):
         raise HTTPException(
@@ -228,6 +267,8 @@ async def update_action_item(
             detail="Access denied",
         )
     
+    previous_assignee = item.assigned_to_user_id
+
     # Update fields
     for field, value in update_data.model_dump(exclude_unset=True).items():
         setattr(item, field, value)
@@ -239,6 +280,23 @@ async def update_action_item(
     elif update_data.status and item.completed_at:
         item.completed_at = None  # type: ignore
     
+    if (
+        update_data.assigned_to_user_id
+        and update_data.assigned_to_user_id != previous_assignee
+        and update_data.assigned_to_user_id != current_user.id
+    ):
+        create_notification(
+            db,
+            user_id=update_data.assigned_to_user_id,
+            organization_id=current_user.organization_id,
+            notification_type="task_assigned",
+            message=f"You were assigned a task: {item.title}",
+            notification_metadata={
+                "action_item_id": str(item.id),
+                "meeting_id": str(item.meeting_id),
+            },
+        )
+
     db.commit()
     db.refresh(item)
     
@@ -248,12 +306,15 @@ async def update_action_item(
 @router.post("/{item_id}/complete", response_model=ActionItemResponse)
 async def complete_action_item(
     item_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Mark action item as complete"""
     result = db.execute(
-        select(ActionItem).where(ActionItem.id == item_id)
+        select(ActionItem).where(
+            ActionItem.id == item_id,
+            ActionItem.organization_id == current_user.organization_id,
+        )
     )
     item = result.scalar_one_or_none()
     
@@ -264,7 +325,8 @@ async def complete_action_item(
         )
 
     if (
-        item.owner_id != current_user.id
+        current_user.role != "admin"
+        and item.assigned_to_user_id != current_user.id
         and str(current_user.id) not in (item.collaborator_ids or [])
     ):
         raise HTTPException(

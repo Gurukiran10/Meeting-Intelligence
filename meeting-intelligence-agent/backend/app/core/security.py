@@ -57,9 +57,6 @@ def decode_token(token: str) -> Dict:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash"""
     try:
-        if not hashed_password.startswith("$"):
-            # Fallback for plain text admin123 initially configured in db
-            return plain_password == hashed_password
         return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
     except Exception:
         return False

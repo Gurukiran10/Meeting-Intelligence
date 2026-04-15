@@ -15,6 +15,7 @@ class Mention(Base):
     __tablename__ = "mentions"
     
     id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(GUID(), ForeignKey("organizations.id"), nullable=False, index=True)
     meeting_id = Column(GUID(), ForeignKey("meetings.id"), nullable=False, index=True)
     user_id = Column(GUID(), ForeignKey("users.id"), nullable=False, index=True)
     transcript_id = Column(GUID(), ForeignKey("transcripts.id"))
@@ -64,6 +65,7 @@ class Mention(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     
     # Relationships
+    organization = relationship("Organization", back_populates="mentions")
     meeting = relationship("Meeting", back_populates="mentions")
     user = relationship("User", back_populates="mentions")
     transcript = relationship("Transcript", back_populates="mentions")

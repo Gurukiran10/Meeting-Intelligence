@@ -22,6 +22,224 @@ logger = logging.getLogger(__name__)
 class PreMeetingBriefService:
     """Service for generating pre-meeting intelligence briefs"""
 
+    def _agenda_topics(self, meeting: Meeting) -> List[str]:
+        agenda = getattr(meeting, "agenda", None)
+        if isinstance(agenda, list):
+            return [str(item).strip() for item in agenda if str(item).strip()]
+        if isinstance(agenda, dict):
+            topics = agenda.get("topics") or agenda.get("items") or []
+            if isinstance(topics, list):
+                return [str(item).strip() for item in topics if str(item).strip()]
+            if isinstance(topics, str) and topics.strip():
+                return [topics.strip()]
+            text = str(agenda.get("summary") or "").strip()
+            return [text] if text else []
+        if isinstance(agenda, str) and agenda.strip():
+            return [agenda.strip()]
+        return []
+
+    def _agenda_text(self, meeting: Meeting) -> str:
+        topics = self._agenda_topics(meeting)
+        if topics:
+            return "; ".join(topics)
+        description = str(getattr(meeting, "description", "") or "").strip()
+        return description
+
+    def _keyword_tokens(self, meeting: Meeting) -> List[str]:
+        raw = " ".join([str(getattr(meeting, "title", "") or ""), self._agenda_text(meeting)]).lower()
+        parts = [token.strip() for token in raw.replace(",", " ").replace(";", " ").split()]
+        return [token for token in parts if len(token) > 3]
+
+    def _resolve_attendee_names(self, db: Session, meeting: Meeting) -> List[str]:
+        names: List[str] = []
+        for attendee_token in list(getattr(meeting, "attendee_ids", None) or []):
+            user = db.execute(
+                select(User).where(
+                    User.organization_id == getattr(meeting, "organization_id", None),
+                    or_(
+                        User.id == attendee_token,
+                        User.email.ilike(str(attendee_token)),
+                        User.username.ilike(str(attendee_token)),
+                    ),
+                )
+            ).scalar_one_or_none()
+            if user:
+                names.append(str(user.full_name or user.username or user.email))
+            else:
+                token_text = str(attendee_token).strip()
+                if token_text:
+                    names.append(token_text)
+        return names
+
+    async def generate_api_brief_for_user(
+        self,
+        db: Session,
+        meeting: Meeting,
+        user: User,
+    ) -> Dict[str, Any]:
+        meeting_context = {
+            "title": str(getattr(meeting, "title", "") or ""),
+            "agenda": self._agenda_text(meeting),
+            "attendees": self._resolve_attendee_names(db, meeting),
+        }
+
+        pending_tasks = db.execute(
+            select(ActionItem).where(
+                ActionItem.organization_id == user.organization_id,
+                ActionItem.assigned_to_user_id == user.id,
+                ActionItem.status.notin_(["completed", "cancelled"]),
+            )
+            .order_by(ActionItem.due_date.asc().nullslast(), ActionItem.created_at.desc())
+        ).scalars().all()
+
+        meeting_keywords = self._keyword_tokens(meeting)
+        recent_mentions = db.execute(
+            select(Mention).where(
+                Mention.organization_id == user.organization_id,
+                Mention.user_id == user.id,
+            )
+            .order_by(Mention.created_at.desc())
+        ).scalars().all()
+
+        relevant_mentions = []
+        for mention in recent_mentions:
+            haystack = " ".join(
+                [
+                    str(getattr(mention, "mentioned_text", "") or ""),
+                    str(getattr(mention, "full_context", "") or ""),
+                    str(getattr(getattr(mention, "meeting", None), "title", "") or ""),
+                ]
+            ).lower()
+            if mention.meeting_id == meeting.id or any(keyword in haystack for keyword in meeting_keywords):
+                relevant_mentions.append(
+                    {
+                        "id": str(mention.id),
+                        "meeting_id": str(mention.meeting_id),
+                        "text": mention.mentioned_text,
+                        "type": mention.mention_type,
+                        "confidence": mention.confidence,
+                        "created_at": mention.created_at.isoformat() if mention.created_at else None,
+                    }
+                )
+            if len(relevant_mentions) >= 5:
+                break
+
+        related_meetings = db.execute(
+            select(Meeting).where(
+                Meeting.organization_id == user.organization_id,
+                Meeting.id != meeting.id,
+                Meeting.deleted_at.is_(None),
+                Meeting.scheduled_start <= getattr(meeting, "scheduled_start", datetime.utcnow()),
+            )
+            .order_by(Meeting.scheduled_start.desc())
+        ).scalars().all()
+
+        recent_developments = []
+        for related_meeting in related_meetings:
+            haystack = " ".join(
+                [
+                    str(getattr(related_meeting, "title", "") or ""),
+                    str(getattr(related_meeting, "summary", "") or ""),
+                    " ".join(self._agenda_topics(related_meeting)),
+                ]
+            ).lower()
+            if meeting_keywords and not any(keyword in haystack for keyword in meeting_keywords):
+                continue
+            recent_developments.append(
+                {
+                    "type": "meeting",
+                    "title": related_meeting.title,
+                    "summary": related_meeting.summary or "No summary available yet.",
+                    "scheduled_start": related_meeting.scheduled_start.isoformat() if related_meeting.scheduled_start else None,
+                }
+            )
+            if len(recent_developments) >= 3:
+                break
+
+        pending_task_payload = [
+            {
+                "id": str(task.id),
+                "title": task.title,
+                "description": task.description,
+                "status": task.status,
+                "priority": task.priority,
+                "due_date": task.due_date.isoformat() if task.due_date else None,
+                "meeting_id": str(task.meeting_id) if task.meeting_id else None,
+            }
+            for task in pending_tasks[:5]
+        ]
+
+        ai_guidance = await nlp_service.generate_pre_meeting_guidance(
+            meeting_context=meeting_context,
+            user_context={
+                "pending_tasks": pending_task_payload,
+                "relevant_mentions": relevant_mentions,
+                "recent_developments": recent_developments,
+                "user_name": user.full_name,
+                "user_role": user.job_title or user.role,
+            },
+        )
+
+        if pending_task_payload:
+            importance = "critical"
+        elif relevant_mentions:
+            importance = "important"
+        else:
+            importance = "optional"
+
+        return {
+            "meeting_context": meeting_context,
+            "user_preparation": {
+                "pending_tasks": pending_task_payload,
+                "relevant_mentions": relevant_mentions,
+                "expected_questions": ai_guidance.get("expected_questions", []),
+            },
+            "recent_developments": recent_developments,
+            "suggested_points": ai_guidance.get("suggested_points", []),
+            "importance": importance,
+        }
+
+    async def list_upcoming_briefs_for_user(
+        self,
+        db: Session,
+        user: User,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        now = datetime.utcnow()
+        meetings = db.execute(
+            select(Meeting).where(
+                Meeting.organization_id == user.organization_id,
+                Meeting.deleted_at.is_(None),
+                Meeting.scheduled_start >= now,
+            )
+            .order_by(Meeting.scheduled_start.asc())
+        ).scalars().all()
+
+        results: List[Dict[str, Any]] = []
+        for meeting in meetings:
+            attendee_tokens = {str(token) for token in (meeting.attendee_ids or [])}
+            if not (
+                meeting.organizer_id == user.id
+                or meeting.created_by == user.id
+                or str(user.id) in attendee_tokens
+                or user.email in attendee_tokens
+                or user.username in attendee_tokens
+            ):
+                continue
+
+            brief = await self.generate_api_brief_for_user(db, meeting, user)
+            results.append(
+                {
+                    "meeting_id": str(meeting.id),
+                    "title": meeting.title,
+                    "scheduled_start": meeting.scheduled_start.isoformat() if meeting.scheduled_start else None,
+                    "importance": brief.get("importance", "optional"),
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
+
     async def generate_brief_for_user(
         self,
         db: Session,

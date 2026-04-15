@@ -2,6 +2,7 @@
 Application Configuration Management
 """
 from typing import List
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     SECRET_KEY: str = "syncminds-dev-secret-change-in-production"
     API_V1_PREFIX: str = "/api/v1"
+    FRONTEND_URL: str = "http://localhost:3002"
     
     # Server
     HOST: str = "0.0.0.0"
@@ -168,6 +170,7 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"
+    TRUSTED_HOSTS: List[str] = ["localhost", "127.0.0.1", "testserver", "*.meetingintel.ai"]
     
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -175,6 +178,13 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="allow"
     )
+
+    @field_validator("ALLOWED_ORIGINS", "ALLOWED_METHODS", "ALLOWED_HEADERS", "TRUSTED_HOSTS", mode="before")
+    @classmethod
+    def split_csv_values(cls, value):
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
 
 settings = Settings()  # type: ignore

@@ -4,13 +4,14 @@ from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.api.v1.endpoints.auth import get_current_user
+from app.api.v1.endpoints.auth import require_org_member
 from app.core.database import get_db
 from app.models.mention import Mention
+from app.models.notification import Notification
 from app.models.user import User
 
 router = APIRouter()
@@ -28,8 +29,7 @@ class MentionResponse(BaseModel):
     notification_read: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 @router.get("/", response_model=List[MentionResponse])
@@ -37,11 +37,14 @@ async def list_mentions(
     skip: int = 0,
     limit: int = 100,
     unread_only: bool = False,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """List mentions for current user"""
-    query = select(Mention).where(Mention.user_id == current_user.id)
+    query = select(Mention).where(
+        Mention.organization_id == current_user.organization_id,
+        Mention.user_id == current_user.id,
+    )
     if unread_only:
         query = query.where(Mention.notification_read.is_(False))
 
@@ -53,13 +56,14 @@ async def list_mentions(
 @router.get("/{mention_id}", response_model=MentionResponse)
 async def get_mention(
     mention_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Get single mention"""
     result = db.execute(
         select(Mention).where(
             Mention.id == mention_id,
+            Mention.organization_id == current_user.organization_id,
             Mention.user_id == current_user.id,
         )
     )
@@ -72,13 +76,14 @@ async def get_mention(
 @router.post("/{mention_id}/read", response_model=MentionResponse)
 async def mark_mention_read(
     mention_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
     """Mark mention as read"""
     result = db.execute(
         select(Mention).where(
             Mention.id == mention_id,
+            Mention.organization_id == current_user.organization_id,
             Mention.user_id == current_user.id,
         )
     )
@@ -88,6 +93,19 @@ async def mark_mention_read(
 
     mention.notification_read = True  # type: ignore
     mention.notification_read_at = datetime.utcnow()  # type: ignore
+
+    notifications = db.execute(
+        select(Notification).where(
+            Notification.organization_id == current_user.organization_id,
+            Notification.user_id == current_user.id,
+            Notification.type == "mention",
+        )
+    ).scalars().all()
+    for notification in notifications:
+        metadata = getattr(notification, "notification_metadata", {}) or {}
+        if str(metadata.get("mention_id", "")) == str(mention.id):
+            notification.is_read = True  # type: ignore
+
     db.commit()
     db.refresh(mention)
     return mention

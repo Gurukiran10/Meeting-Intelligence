@@ -1,7 +1,7 @@
 """Create audit_log, notification_idempotency, and retention_policy tables
 
 Revision ID: 003_add_audit_and_retention
-Revises: 002_initial_models
+Revises: 
 Create Date: 2026-04-11 10:00:00.000000
 
 """
@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision = '003_add_audit_and_retention'
-down_revision = '002_initial_models'
+down_revision = None
 branch_labels = None
 depends_on = None
 

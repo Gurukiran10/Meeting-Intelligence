@@ -62,7 +62,7 @@ def init_db() -> None:
     """Initialize database"""
     try:
         # Import all models here to ensure they are registered
-        from app.models import user, meeting, transcript, action_item, mention
+        from app.models import organization, user, meeting, transcript, action_item, mention
         
         # Create tables
         Base.metadata.create_all(bind=engine)

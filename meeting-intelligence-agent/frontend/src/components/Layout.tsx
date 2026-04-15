@@ -1,12 +1,13 @@
-import React from 'react'
+import React, { useMemo, useState } from 'react'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
-import { useQuery } from 'react-query'
+import { useQuery, useQueryClient } from 'react-query'
 import {
   LayoutDashboard,
   Calendar,
   CheckSquare,
   Bell,
   BarChart3,
+  Users,
   Settings,
   LogOut,
   Plug,
@@ -23,14 +24,44 @@ import { Separator } from '@/components/ui/separator'
 
 const Layout: React.FC = () => {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
   const { data: currentUser } = useQuery('current-user', async () => {
     const response = await api.get('/api/v1/auth/me')
     return response.data
   })
+  const { data: notifications = [] } = useQuery('notifications', async () => {
+    const response = await api.get('/api/v1/notifications', { params: { limit: 8 } })
+    return response.data
+  })
 
   const handleLogout = () => {
-    clearTokens()
-    window.location.href = '/login'
+    api.post('/api/v1/auth/logout').finally(() => {
+      clearTokens()
+      window.location.href = '/login'
+    })
+  }
+
+  const unreadCount = useMemo(
+    () => notifications.filter((notification: any) => !notification.is_read).length,
+    [notifications],
+  )
+
+  const markNotificationRead = async (notificationId: string) => {
+    await api.patch(`/api/v1/notifications/${notificationId}/read`)
+    queryClient.invalidateQueries('notifications')
+  }
+
+  const openNotificationTarget = async (notification: any) => {
+    if (!notification.is_read) {
+      await markNotificationRead(notification.id)
+    }
+    setNotificationsOpen(false)
+    if (notification.type === 'task_assigned') {
+      navigate('/action-items')
+      return
+    }
+    navigate('/mentions')
   }
 
   const navigation = [
@@ -39,6 +70,7 @@ const Layout: React.FC = () => {
     { name: 'Action Items', to: '/action-items', icon: CheckSquare },
     { name: 'Mentions', to: '/mentions', icon: Bell },
     { name: 'Analytics', to: '/analytics', icon: BarChart3 },
+    { name: 'Team', to: '/team', icon: Users },
     { name: 'Integrations', to: '/integrations', icon: Plug },
     { name: 'Settings', to: '/settings', icon: Settings },
   ]
@@ -144,10 +176,69 @@ const Layout: React.FC = () => {
                 Connect Integrations
              </Button>
              <Separator orientation="vertical" className="h-6 mx-1 hidden md:block" />
-             <Button variant="ghost" size="icon" className="relative text-slate-500 hover:text-blue-600 transition-colors" onClick={() => navigate('/mentions')}>
-                <Bell className="w-5 h-5" />
-                <span className="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full border-2 border-white"></span>
-             </Button>
+             <div className="relative">
+               <Button
+                 variant="ghost"
+                 size="icon"
+                 className="relative text-slate-500 hover:text-blue-600 transition-colors"
+                 onClick={() => setNotificationsOpen((open) => !open)}
+               >
+                  <Bell className="w-5 h-5" />
+                  {unreadCount > 0 ? (
+                    <span className="absolute top-1.5 right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-[10px] font-bold text-white flex items-center justify-center border-2 border-white">
+                      {unreadCount > 9 ? '9+' : unreadCount}
+                    </span>
+                  ) : null}
+               </Button>
+
+               {notificationsOpen ? (
+                 <div className="absolute right-0 mt-3 w-96 rounded-2xl border border-slate-200 bg-white shadow-xl overflow-hidden">
+                   <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
+                     <div>
+                       <p className="text-sm font-bold text-slate-900">Notifications</p>
+                       <p className="text-xs text-slate-500">
+                         {unreadCount > 0 ? `${unreadCount} unread` : 'All caught up'}
+                       </p>
+                     </div>
+                     <Button variant="ghost" size="sm" className="text-xs" onClick={() => navigate('/mentions')}>
+                       View Mentions
+                     </Button>
+                   </div>
+                   <div className="max-h-[420px] overflow-y-auto">
+                     {notifications.length ? notifications.map((notification: any) => (
+                       <button
+                         key={notification.id}
+                         type="button"
+                         onClick={() => openNotificationTarget(notification)}
+                         className={cn(
+                           'w-full text-left px-4 py-3 border-b border-slate-100 hover:bg-slate-50 transition-colors',
+                           !notification.is_read && 'bg-blue-50/50'
+                         )}
+                       >
+                         <div className="flex items-start justify-between gap-3">
+                           <div className="min-w-0">
+                             <p className="text-sm font-semibold text-slate-900">{notification.message}</p>
+                             <p className="mt-1 text-xs uppercase tracking-wide text-slate-400">
+                               {notification.type.replace('_', ' ')}
+                             </p>
+                             <p className="mt-1 text-xs text-slate-500">
+                               {new Date(notification.created_at).toLocaleString()}
+                             </p>
+                           </div>
+                           {!notification.is_read ? (
+                             <span className="mt-1 h-2.5 w-2.5 rounded-full bg-blue-600 shrink-0"></span>
+                           ) : null}
+                         </div>
+                       </button>
+                     )) : (
+                       <div className="px-4 py-10 text-center text-sm text-slate-400">
+                         No notifications yet.
+                       </div>
+                     )}
+                   </div>
+                 </div>
+               ) : null}
+             </div>
              <Button variant="ghost" size="icon" className="text-slate-500 hover:text-blue-600 transition-colors" onClick={() => navigate('/settings')}>
                 <Settings className="w-5 h-5" />
              </Button>

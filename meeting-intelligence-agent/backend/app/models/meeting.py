@@ -15,6 +15,7 @@ class Meeting(Base):
     __tablename__ = "meetings"
     
     id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(GUID(), ForeignKey("organizations.id"), nullable=False, index=True)
     
     # Basic Info
     title = Column(String(500), nullable=False)
@@ -32,6 +33,7 @@ class Meeting(Base):
     duration_minutes = Column(Integer)
     
     # Participants
+    created_by = Column(GUID(), ForeignKey("users.id"), nullable=False, index=True)
     organizer_id = Column(GUID(), ForeignKey("users.id"))
     attendee_ids = Column(JSON, default=[])  # List of user ID strings
     attendee_count = Column(Integer, default=0)
@@ -74,6 +76,7 @@ class Meeting(Base):
     deleted_at = Column(DateTime)  # Soft delete
     
     # Relationships
+    organization = relationship("Organization", back_populates="meetings")
     organizer = relationship("User", back_populates="meetings", foreign_keys=[organizer_id])
     transcripts = relationship("Transcript", back_populates="meeting", cascade="all, delete-orphan")
     action_items = relationship("ActionItem", back_populates="meeting", cascade="all, delete-orphan")

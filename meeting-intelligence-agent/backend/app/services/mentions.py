@@ -13,6 +13,7 @@ from app.models.action_item import ActionItem
 from app.models.meeting import Meeting
 from app.models.mention import Mention
 from app.models.user import User
+from app.services.notifications import create_notification
 from app.services.ai.nlp import MentionDetection, nlp_service
 from app.services.integrations.slack import slack_service
 
@@ -261,7 +262,12 @@ async def detect_and_store_mentions(
 
     users = candidate_users
     if users is None:
-        users = db.execute(select(User).where(User.is_active.is_(True))).scalars().all()
+        users = db.execute(
+            select(User).where(
+                User.is_active.is_(True),
+                User.organization_id == meeting.organization_id,
+            )
+        ).scalars().all()
 
     if not users:
         return []
@@ -299,6 +305,7 @@ async def detect_and_store_mentions(
         alert_details = _build_alert_details(db, meeting, matched_user, detection)
 
         mention = Mention(
+            organization_id=meeting.organization_id,
             meeting_id=meeting.id,
             user_id=matched_user.id,
             transcript_id=transcript_id,
@@ -330,6 +337,19 @@ async def detect_and_store_mentions(
         )
         db.add(mention)
         db.flush()
+
+        create_notification(
+            db,
+            user_id=matched_user.id,
+            organization_id=meeting.organization_id,
+            notification_type="mention",
+            message=f"You were mentioned in {meeting.title}",
+            notification_metadata={
+                "mention_id": str(mention.id),
+                "meeting_id": str(meeting.id),
+                "mention_type": detection.mention_type,
+            },
+        )
 
 
         notification_settings = _as_dict(matched_user.notification_settings)

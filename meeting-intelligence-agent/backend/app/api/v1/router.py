@@ -5,6 +5,9 @@ from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
     auth,
+    dashboard,
+    organizations,
+    notifications,
     meetings,
     transcripts,
     action_items,
@@ -18,6 +21,9 @@ api_router = APIRouter()
 
 # Include all sub-routers
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+api_router.include_router(dashboard.router, tags=["Dashboard"])
+api_router.include_router(organizations.router, prefix="/org", tags=["Organization"])
+api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
 api_router.include_router(users.router, prefix="/users", tags=["Users"])
 api_router.include_router(meetings.router, prefix="/meetings", tags=["Meetings"])
 api_router.include_router(transcripts.router, prefix="/transcripts", tags=["Transcripts"])
