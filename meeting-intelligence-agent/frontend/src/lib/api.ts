@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { clearTokens } from './auth'
+import { clearTokens, getAccessToken } from './auth'
 
 const envApiBaseUrl = import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL
 const defaultApiBaseUrl = ''
@@ -9,6 +9,15 @@ export const api = axios.create({
   baseURL: API_BASE_URL,
   timeout: 60000,
   withCredentials: true,
+})
+
+api.interceptors.request.use((config) => {
+  const token = getAccessToken()
+  if (token) {
+    config.headers.set('Authorization', `Bearer ${token}`)
+    console.log('[auth] token sent in headers', `Bearer ${token}`)
+  }
+  return config
 })
 
 api.interceptors.response.use(

@@ -1,14 +1,15 @@
 import React, { useState } from 'react'
 import { Navigate } from 'react-router-dom'
-import { useQuery } from 'react-query'
+import { useQuery, useQueryClient } from 'react-query'
 import { api } from '../lib/api'
-import { clearTokens } from '../lib/auth'
+import { clearTokens, storeTokens } from '../lib/auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { AlertCircle, Lock, User, Eye, EyeOff } from 'lucide-react'
 
 const Login: React.FC = () => {
+  const queryClient = useQueryClient()
   const [mode, setMode] = useState<'login' | 'signup'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -41,13 +42,15 @@ const Login: React.FC = () => {
         const params = new URLSearchParams()
         params.append('username', username)
         params.append('password', password)
-        await api.post('/api/v1/auth/login', params, {
+        const response = await api.post('/api/v1/auth/login', params, {
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
           },
         })
+        console.log('[auth] token received', response.data?.access_token)
+        storeTokens(response.data?.access_token, response.data?.refresh_token)
       } else {
-        await api.post('/api/v1/auth/signup', {
+        const response = await api.post('/api/v1/auth/signup', {
           email,
           username,
           full_name: fullName,
@@ -56,8 +59,12 @@ const Login: React.FC = () => {
           organization_name: createOrganization ? organizationName : undefined,
           organization_slug: organizationSlug || undefined,
         })
+        console.log('[auth] token received', response.data?.access_token)
+        storeTokens(response.data?.access_token, response.data?.refresh_token)
       }
 
+      await queryClient.invalidateQueries('auth-session')
+      await queryClient.invalidateQueries('login-session')
       window.location.href = '/dashboard'
     } catch (e: any) {
       clearTokens()

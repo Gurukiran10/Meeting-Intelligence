@@ -188,6 +188,8 @@ async def signup(
     _set_auth_cookies(response, access_token, refresh_token)
 
     return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": _serialize_user(user, organization),
     }
@@ -232,6 +234,8 @@ async def login(
     db.commit()
 
     return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": _serialize_user(user, organization),
     }
@@ -261,6 +265,8 @@ async def refresh_session(
     _set_auth_cookies(response, new_access_token, new_refresh_token)
 
     return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
         "token_type": "bearer",
         "user": _serialize_user(user, organization),
     }
