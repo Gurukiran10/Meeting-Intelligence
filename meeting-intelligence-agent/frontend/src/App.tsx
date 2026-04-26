@@ -16,6 +16,7 @@ import AcceptInvite from './pages/AcceptInvite'
 import Layout from './components/Layout'
 import './index.css'
 import { useQuery } from 'react-query'
+import { getAccessToken } from './lib/auth'
 
 const LoginEntry: React.FC = () => {
   const [searchParams] = useSearchParams()
@@ -29,11 +30,16 @@ const LoginEntry: React.FC = () => {
 }
 
 const ProtectedRoute: React.FC<{ children: React.ReactElement }> = ({ children }) => {
+  const hasToken = Boolean(getAccessToken())
   const { data, isLoading, isError } = useQuery(
     'auth-session',
     async () => (await api.get('/api/v1/auth/me')).data,
-    { retry: false, refetchOnWindowFocus: false },
+    { retry: false, refetchOnWindowFocus: false, enabled: hasToken },
   )
+
+  if (!hasToken) {
+    return <Navigate to="/login" replace />
+  }
 
   if (isLoading) {
     return <div className="min-h-screen flex items-center justify-center text-slate-500">Loading workspace...</div>

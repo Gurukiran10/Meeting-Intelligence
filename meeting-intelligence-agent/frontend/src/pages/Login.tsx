@@ -1,8 +1,8 @@
 import React, { useState } from 'react'
 import { Navigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from 'react-query'
-import { api } from '../lib/api'
-import { clearTokens, storeTokens } from '../lib/auth'
+import { api, getApiTargetLabel } from '../lib/api'
+import { clearTokens, getAccessToken, storeTokens } from '../lib/auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
@@ -10,6 +10,7 @@ import { AlertCircle, Lock, User, Eye, EyeOff } from 'lucide-react'
 
 const Login: React.FC = () => {
   const queryClient = useQueryClient()
+  const hasToken = Boolean(getAccessToken())
   const [mode, setMode] = useState<'login' | 'signup'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -25,7 +26,7 @@ const Login: React.FC = () => {
   const { data: sessionUser } = useQuery(
     'login-session',
     async () => (await api.get('/api/v1/auth/me')).data,
-    { retry: false, refetchOnWindowFocus: false },
+    { retry: false, refetchOnWindowFocus: false, enabled: hasToken },
   )
 
   if (sessionUser) {
@@ -49,6 +50,7 @@ const Login: React.FC = () => {
         })
         console.log('[auth] token received', response.data?.access_token)
         storeTokens(response.data?.access_token, response.data?.refresh_token)
+        console.log('[auth] token after login', getAccessToken())
       } else {
         const response = await api.post('/api/v1/auth/signup', {
           email,
@@ -61,10 +63,16 @@ const Login: React.FC = () => {
         })
         console.log('[auth] token received', response.data?.access_token)
         storeTokens(response.data?.access_token, response.data?.refresh_token)
+        console.log('[auth] token after login', getAccessToken())
       }
 
       await queryClient.invalidateQueries('auth-session')
       await queryClient.invalidateQueries('login-session')
+
+      if (!getAccessToken()) {
+        throw new Error('Access token was not stored after login.')
+      }
+
       window.location.href = '/dashboard'
     } catch (e: any) {
       clearTokens()
@@ -74,7 +82,7 @@ const Login: React.FC = () => {
       } else if (e?.code === 'ECONNABORTED') {
         setError('Login request timed out. Backend may be busy. Please try again in a few seconds.')
       } else if (!e?.response) {
-        const target = String(api.defaults.baseURL || 'http://localhost:8002')
+        const target = getApiTargetLabel()
         setError(`Cannot reach backend at ${target}. Make sure backend is running and reachable.`)
       } else {
         setError('Login failed. Please check your credentials.')

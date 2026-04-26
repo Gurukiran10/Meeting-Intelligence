@@ -50,3 +50,30 @@ def test_invalid_login_rejected(client, db_session, org_a):
 
     assert response.status_code == 401
     assert response.json()["detail"] == "Incorrect username or password"
+
+
+def test_login_unexpected_error_returns_500(client, db_session, org_a, monkeypatch):
+    from tests.conftest import create_user
+    from app.api.v1.endpoints import auth as auth_endpoints
+
+    create_user(
+        db_session,
+        org_a,
+        email="crash@example.com",
+        username="crash",
+        full_name="Crash Test",
+        password="password123",
+    )
+
+    def crash_verify_password(*args, **kwargs):
+        raise RuntimeError("bcrypt failure")
+
+    monkeypatch.setattr(auth_endpoints, "verify_password", crash_verify_password)
+
+    response = client.post(
+        "/api/v1/auth/login",
+        data={"username": "crash", "password": "password123"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Unable to process login right now"

@@ -14,6 +14,7 @@ import {
   Users
 } from 'lucide-react'
 import { api } from '../lib/api'
+import { getAccessToken } from '../lib/auth'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -21,10 +22,13 @@ import { cn } from '@/lib/utils'
 
 const Dashboard: React.FC = () => {
   const navigate = useNavigate()
+  const hasToken = Boolean(getAccessToken())
   
   const { data: currentUser } = useQuery('dashboard-current-user', async () => {
     const response = await api.get('/api/v1/auth/me')
     return response.data
+  }, {
+    enabled: hasToken,
   })
 
   const { data: myDashboard } = useQuery('my-dashboard', async () => {

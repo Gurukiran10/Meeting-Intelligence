@@ -12,10 +12,12 @@ from sqlalchemy.orm import Session
 from app.models.action_item import ActionItem
 from app.models.meeting import Meeting
 from app.models.mention import Mention
+from app.models.notification import Notification
 from app.models.user import User
 from app.services.notifications import create_notification
 from app.services.ai.nlp import MentionDetection, nlp_service
 from app.services.integrations.slack import slack_service
+from app.services.slack_service import send_slack_dm
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +297,6 @@ async def detect_and_store_mentions(
             select(Mention).where(
                 Mention.meeting_id == meeting.id,
                 Mention.user_id == matched_user.id,
-                Mention.mention_type == detection.mention_type,
                 Mention.mentioned_text == detection.text[:1000],
             )
         ).scalar_one_or_none()
@@ -338,19 +339,42 @@ async def detect_and_store_mentions(
         db.add(mention)
         db.flush()
 
-        create_notification(
-            db,
-            user_id=matched_user.id,
-            organization_id=meeting.organization_id,
-            notification_type="mention",
-            message=f"You were mentioned in {meeting.title}",
-            notification_metadata={
-                "mention_id": str(mention.id),
-                "meeting_id": str(meeting.id),
-                "mention_type": detection.mention_type,
-            },
+        # ── Build the rich notification message ─────────────────────────
+        rich_message = (
+            f"👋 You were mentioned in a meeting\n\n"
+            f"📌 Meeting: {meeting.title}\n"
+            f"📎 View: {meeting_link}\n"
         )
+        task_title = alert_details.get("dependency")
+        due_date_str = alert_details.get("due_date")
+        if task_title:
+            rich_message += f"\n📌 Task: {task_title}"
+        if due_date_str:
+            rich_message += f"\n⏰ Deadline: {due_date_str}"
 
+        # ── Dedup: skip if a Phase 1 notification already exists ────────
+        existing_notif = db.execute(
+            select(Notification).where(
+                Notification.user_id == matched_user.id,
+                Notification.notification_metadata["meeting_id"].as_string() == str(meeting.id),
+                Notification.type == "mention",
+            )
+        ).scalar_one_or_none()
+
+        if not existing_notif:
+            create_notification(
+                db,
+                user_id=matched_user.id,
+                organization_id=meeting.organization_id,
+                notification_type="mention",
+                message=rich_message,
+                notification_metadata={
+                    "mention_id": str(mention.id),
+                    "meeting_id": str(meeting.id),
+                    "mention_type": detection.mention_type,
+                    "source": "heuristic_detection",
+                },
+            )
 
         notification_settings = _as_dict(matched_user.notification_settings)
         slack_settings = dict((matched_user.integrations or {}).get("slack", {}))
@@ -361,8 +385,14 @@ async def detect_and_store_mentions(
 
         # Only send alert if confidence meets threshold
         if send_real_time_alerts and mention_confidence >= confidence_threshold:
-            # Slack alert
-            if "slack" in alert_channels and notification_settings.get("slack_enabled", True) and notification_settings.get("real_time_mentions", True) and slack_settings.get("bot_token") and recipient_email:
+            # ── Org-level Slack integration (rich block kit alert) ───────
+            if (
+                "slack" in alert_channels
+                and notification_settings.get("slack_enabled", True)
+                and notification_settings.get("real_time_mentions", True)
+                and slack_settings.get("bot_token")
+                and recipient_email
+            ):
                 try:
                     await slack_service.send_mention_alert_via_token(
                         bot_token=slack_settings["bot_token"],
@@ -386,7 +416,12 @@ async def detect_and_store_mentions(
                     setattr(mention, "notification_sent_at", datetime.utcnow())
                     setattr(mention, "notification_type", "slack")
                 except Exception as exc:
-                    logger.warning("Failed to send mention alert for %s: %s", matched_user.email, exc)
+                    logger.warning("Failed to send org Slack mention alert for %s: %s", matched_user.email, exc)
+
+            # ── Personal Slack DM via slack_user_id (simple path) ───────
+            elif matched_user.slack_user_id:
+                send_slack_dm(matched_user.slack_user_id, rich_message)
+
             # Email alert (placeholder for future implementation)
             if "email" in alert_channels and notification_settings.get("email_enabled", True) and recipient_email:
                 # TODO: Implement email alert logic

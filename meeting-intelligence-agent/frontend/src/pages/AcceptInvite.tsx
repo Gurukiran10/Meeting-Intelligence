@@ -3,7 +3,8 @@ import { Navigate, useSearchParams } from 'react-router-dom'
 import { AlertCircle, Eye, EyeOff, Lock, User, UserPlus } from 'lucide-react'
 import { useQuery } from 'react-query'
 
-import { api } from '../lib/api'
+import { api, getApiTargetLabel } from '../lib/api'
+import { getAccessToken } from '../lib/auth'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -11,6 +12,7 @@ import { Input } from '@/components/ui/input'
 const AcceptInvite: React.FC = () => {
   const [searchParams] = useSearchParams()
   const token = useMemo(() => searchParams.get('invite') || '', [searchParams])
+  const hasToken = Boolean(getAccessToken())
 
   const [fullName, setFullName] = useState('')
   const [username, setUsername] = useState('')
@@ -22,7 +24,7 @@ const AcceptInvite: React.FC = () => {
   const { data: sessionUser } = useQuery(
     ['accept-invite-session'],
     async () => (await api.get('/api/v1/auth/me')).data,
-    { retry: false, refetchOnWindowFocus: false },
+    { retry: false, refetchOnWindowFocus: false, enabled: hasToken },
   )
 
   const { data: invitePreview, isLoading: isPreviewLoading } = useQuery(
@@ -59,7 +61,7 @@ const AcceptInvite: React.FC = () => {
       } else if (e?.code === 'ECONNABORTED') {
         setError('Invite request timed out. Please try again.')
       } else if (!e?.response) {
-        const target = String(api.defaults.baseURL || 'http://localhost:8002')
+        const target = getApiTargetLabel()
         setError(`Cannot reach backend at ${target}. Make sure backend is running and reachable.`)
       } else {
         setError('Unable to accept invite right now. Please try again.')

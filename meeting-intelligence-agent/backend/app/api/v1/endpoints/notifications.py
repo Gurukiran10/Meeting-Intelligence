@@ -50,6 +50,23 @@ async def list_notifications(
     return result.scalars().all()
 
 
+@router.patch("/read-all", response_model=dict)
+async def mark_all_notifications_read(
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import update
+    db.execute(
+        update(Notification).where(
+            Notification.organization_id == current_user.organization_id,
+            Notification.user_id == current_user.id,
+            Notification.is_read.is_(False)
+        ).values(is_read=True)
+    )
+    db.commit()
+    return {"status": "ok"}
+
+
 @router.patch("/{notification_id}/read", response_model=NotificationResponse)
 async def mark_notification_read(
     notification_id: UUID,

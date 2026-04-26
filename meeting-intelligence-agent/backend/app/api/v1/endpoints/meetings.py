@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 from app.core.database import get_db
 from app.models.meeting import Meeting
+from app.models.action_item import ActionItem
+from app.models.mention import Mention
 from app.models.user import User
 from app.api.v1.endpoints.auth import get_current_user, require_org_member
 from app.tasks.meeting_processor import process_meeting_recording_background
@@ -169,6 +171,39 @@ class MeetingResponse(BaseModel):
     created_at: datetime
 
 
+class InlineActionItemResponse(BaseModel):
+    """Action item included inline in meeting detail"""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    title: str
+    description: Optional[str] = None
+    assigned_to_user_id: Optional[UUID] = None
+    status: str = "open"
+    priority: str = "medium"
+    due_date: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    extraction_method: Optional[str] = None
+    confidence_score: Optional[float] = None
+    created_at: datetime
+
+
+class InlineMentionResponse(BaseModel):
+    """Mention included inline in meeting detail"""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    meeting_id: UUID
+    user_id: Optional[UUID] = None
+    mention_type: str
+    mentioned_text: str
+    relevance_score: Optional[float] = None
+    urgency_score: Optional[float] = None
+    sentiment: Optional[str] = None
+    notification_read: bool = False
+    created_at: datetime
+
+
 class MeetingDetail(MeetingResponse):
     """Detailed meeting response with relationships"""
     transcription_status: str
@@ -177,6 +212,8 @@ class MeetingDetail(MeetingResponse):
     discussion_topics: Optional[List[str]]
     sentiment_score: Optional[float]
     meeting_quality_score: Optional[float]
+    action_items: List[InlineActionItemResponse] = []
+    mentions: List[InlineMentionResponse] = []
 
 
 class PreBriefMeetingContext(BaseModel):
@@ -300,7 +337,7 @@ async def get_meeting(
     current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
-    """Get meeting details"""
+    """Get meeting details with inline action items and mentions"""
     result = db.execute(
         select(Meeting).where(Meeting.id == meeting_id)
     )
@@ -319,8 +356,38 @@ async def get_meeting(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
         )
-    
-    return meeting
+
+    # Fetch all action items for this meeting (not user-scoped)
+    action_items_result = db.execute(
+        select(ActionItem)
+        .where(
+            ActionItem.meeting_id == meeting_id,
+            ActionItem.organization_id == meeting.organization_id,
+        )
+        .order_by(ActionItem.created_at.desc())
+    )
+    meeting_action_items = action_items_result.scalars().all()
+
+    # Fetch all mentions for this meeting (not user-scoped)
+    mentions_result = db.execute(
+        select(Mention)
+        .where(
+            Mention.meeting_id == meeting_id,
+            Mention.organization_id == meeting.organization_id,
+        )
+        .order_by(Mention.created_at.desc())
+    )
+    meeting_mentions = mentions_result.scalars().all()
+
+    # Build response with inline data
+    meeting_dict = {
+        col.name: getattr(meeting, col.name)
+        for col in Meeting.__table__.columns
+    }
+    meeting_dict["action_items"] = meeting_action_items
+    meeting_dict["mentions"] = meeting_mentions
+
+    return MeetingDetail.model_validate(meeting_dict)
 
 
 @router.post("/{meeting_id}/upload", response_model=MeetingResponse)

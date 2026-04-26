@@ -17,7 +17,7 @@ class Mention(Base):
     id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     organization_id = Column(GUID(), ForeignKey("organizations.id"), nullable=False, index=True)
     meeting_id = Column(GUID(), ForeignKey("meetings.id"), nullable=False, index=True)
-    user_id = Column(GUID(), ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(GUID(), ForeignKey("users.id"), nullable=True, index=True)
     transcript_id = Column(GUID(), ForeignKey("transcripts.id"))
     
     # Mention Type

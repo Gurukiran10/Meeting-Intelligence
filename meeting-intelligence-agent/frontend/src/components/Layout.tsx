@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useMemo, useState, useEffect, useRef } from 'react'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from 'react-query'
 import {
@@ -12,10 +12,11 @@ import {
   LogOut,
   Plug,
   User as UserIcon,
-  ChevronRight
+  ChevronRight,
+  CheckCheck
 } from 'lucide-react'
 import { api } from '../lib/api'
-import { clearTokens } from '../lib/auth'
+import { clearTokens, getAccessToken } from '../lib/auth'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
@@ -26,13 +27,35 @@ const Layout: React.FC = () => {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const dropdownRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setNotificationsOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
+  const markAllRead = async () => {
+    await api.patch('/api/v1/notifications/read-all')
+    queryClient.invalidateQueries('notifications')
+  }
+
+  const hasToken = Boolean(getAccessToken())
   const { data: currentUser } = useQuery('current-user', async () => {
     const response = await api.get('/api/v1/auth/me')
     return response.data
+  }, {
+    enabled: hasToken,
   })
   const { data: notifications = [] } = useQuery('notifications', async () => {
-    const response = await api.get('/api/v1/notifications', { params: { limit: 8 } })
+    const response = await api.get('/api/v1/notifications/', { params: { limit: 8 } })
     return response.data
+  }, {
+    enabled: hasToken,
   })
 
   const handleLogout = () => {
@@ -176,7 +199,7 @@ const Layout: React.FC = () => {
                 Connect Integrations
              </Button>
              <Separator orientation="vertical" className="h-6 mx-1 hidden md:block" />
-             <div className="relative">
+             <div className="relative" ref={dropdownRef}>
                <Button
                  variant="ghost"
                  size="icon"
@@ -200,9 +223,17 @@ const Layout: React.FC = () => {
                          {unreadCount > 0 ? `${unreadCount} unread` : 'All caught up'}
                        </p>
                      </div>
-                     <Button variant="ghost" size="sm" className="text-xs" onClick={() => navigate('/mentions')}>
-                       View Mentions
-                     </Button>
+                     <div className="flex items-center space-x-2">
+                       {unreadCount > 0 && (
+                         <Button variant="ghost" size="sm" className="text-xs text-blue-600 hover:text-blue-700 hover:bg-blue-50 px-2" onClick={markAllRead}>
+                           <CheckCheck className="w-4 h-4 mr-1" />
+                           Mark all read
+                         </Button>
+                       )}
+                       <Button variant="ghost" size="sm" className="text-xs px-2" onClick={() => navigate('/mentions')}>
+                         View Mentions
+                       </Button>
+                     </div>
                    </div>
                    <div className="max-h-[420px] overflow-y-auto">
                      {notifications.length ? notifications.map((notification: any) => (
@@ -216,14 +247,14 @@ const Layout: React.FC = () => {
                          )}
                        >
                          <div className="flex items-start justify-between gap-3">
-                           <div className="min-w-0">
-                             <p className="text-sm font-semibold text-slate-900">{notification.message}</p>
-                             <p className="mt-1 text-xs uppercase tracking-wide text-slate-400">
-                               {notification.type.replace('_', ' ')}
+                           <div className="min-w-0 flex-1">
+                             <p className="text-sm text-slate-800 whitespace-pre-line leading-relaxed">
+                               {notification.message}
                              </p>
-                             <p className="mt-1 text-xs text-slate-500">
-                               {new Date(notification.created_at).toLocaleString()}
-                             </p>
+                             <div className="mt-2 flex items-center justify-between text-[11px] font-medium text-slate-400 uppercase tracking-wider">
+                               <span>{notification.type.replace('_', ' ')}</span>
+                               <span>{new Date(notification.created_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</span>
+                             </div>
                            </div>
                            {!notification.is_read ? (
                              <span className="mt-1 h-2.5 w-2.5 rounded-full bg-blue-600 shrink-0"></span>

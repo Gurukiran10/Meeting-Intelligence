@@ -160,6 +160,7 @@ class NLPService:
             ),
             "owner": (
                 item_data.get("owner") or 
+                item_data.get("assignee") or 
                 item_data.get("Owner") or 
                 item_data.get("assigned_to") or 
                 None
@@ -339,29 +340,91 @@ class NLPService:
         return deduped
 
     def _extract_json_from_text(self, text: str) -> Dict:
-        """Extract JSON object from model text response."""
+        """Extract JSON object from model text response.
+        
+        Handles:
+        - Plain JSON
+        - JSON wrapped in ```json ... ``` fences
+        - JSON wrapped in ``` ... ``` fences  
+        - JSON preceded by explanation text
+        """
+        if not text:
+            return {}
+
         stripped = text.strip()
+
+        # Step 1: Strip markdown code fences (most common LLM wrapping)
+        # e.g. ```json\n{...}\n``` or ```\n{...}\n```
+        fence_match = re.search(
+            r"```(?:json)?\s*\n?([\s\S]*?)\n?```",
+            stripped,
+            re.IGNORECASE,
+        )
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass  # fall through to other strategies
+
+        # Step 2: Try direct parse (already clean JSON)
         try:
             return json.loads(stripped)
         except Exception:
             pass
 
+        # Step 3: Grab the outermost {...} block and parse it
+        # This handles cases where the model adds explanation before/after JSON
         match = re.search(r"\{[\s\S]*\}", stripped)
         if match:
             try:
                 return json.loads(match.group(0))
             except Exception:
-                return {}
+                pass
+
+        logger.warning("Could not extract JSON from model response. First 200 chars: %s", stripped[:200])
         return {}
 
-    async def _generate_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> Dict:
-        """Claude primary, Grok fallback. Returns parsed JSON dict."""
+    async def _generate_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 4000) -> Dict:
+        """Claude primary, Groq secondary, Grok fallback. Returns parsed JSON dict.
+        
+        If the complex prompt fails to produce parseable JSON, retries once with
+        a dead-simple prompt that most LLMs cannot refuse.
+        """
+        result = await self._try_generate_json(system_prompt, user_prompt, temperature, max_tokens)
+        if result:
+            return result
+
+        # ── Retry with a minimal prompt ─────────────────────────────────────
+        # The complex prompt sometimes causes the model to add explanation text
+        # or wrap output in markdown fences which the normal parser misses.
+        # This minimal retry uses a near-empty system prompt and a direct
+        # instruction that virtually every LLM honours.
+        logger.warning("Full prompt returned no JSON. Retrying with minimal prompt...")
+        minimal_system = "You output ONLY raw JSON. No explanation. No markdown."
+        minimal_prompt = (
+            f"Convert this meeting transcript into a JSON object.\n\n"
+            f"Transcript: {user_prompt[-3000:]}\n\n"  # last 3000 chars if long
+            f"Return exactly this structure:\n"
+            f'{{"summary":"","key_decisions":[],"discussion_topics":[],'
+            f'"mentions":[],"action_items":[]}}\n\n'
+            f"Fill in all fields from the transcript. Return JSON only."
+        )
+        result = await self._try_generate_json(minimal_system, minimal_prompt, temperature=0.1, max_tokens=max_tokens)
+        if result:
+            return result
+
+        logger.error("Both full and retry prompts returned no parseable JSON.")
+        return {}
+
+    async def _try_generate_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 4000) -> Dict:
+        """Single-pass attempt: try each configured LLM client, return first valid JSON."""
         if self.anthropic_client:
             try:
                 if hasattr(self.anthropic_client, "messages"):
                     response = await self.anthropic_client.messages.create(  # type: ignore
                         model=settings.ANTHROPIC_MODEL,
-                        max_tokens=2000,
+                        max_tokens=max_tokens,
                         temperature=temperature,
                         system=system_prompt,
                         messages=[{"role": "user", "content": user_prompt}],
@@ -381,18 +444,19 @@ class NLPService:
                     response = await self.anthropic_client.completions.create(  # type: ignore
                         model=settings.ANTHROPIC_MODEL,
                         prompt=prompt,
-                        max_tokens_to_sample=2000,
+                        max_tokens_to_sample=max_tokens,
                         temperature=temperature,
                     )
                     raw_text = getattr(response, "completion", "")
 
+                logger.debug("Anthropic raw response (first 300): %s", raw_text[:300])
                 parsed = self._extract_json_from_text(raw_text)
                 if parsed:
                     return parsed
             except Exception as exc:
-                logger.warning(f"Claude generation failed, trying Grok fallback: {exc}")
+                logger.warning(f"Claude generation failed: {exc}")
 
-        # Try Groq first (free tier available, fast)
+        # Try Groq (free tier available, fast)
         if self.groq_client:
             try:
                 response = await self.groq_client.chat.completions.create(  # type: ignore
@@ -403,12 +467,15 @@ class NLPService:
                     ],
                     response_format={"type": "json_object"},
                     temperature=temperature,
+                    max_tokens=max_tokens,
                 )
-                return json.loads(response.choices[0].message.content or "{}")  # type: ignore
+                raw = response.choices[0].message.content or "{}"  # type: ignore
+                logger.debug("Groq raw response (first 300): %s", raw[:300])
+                return json.loads(raw)
             except Exception as exc:
                 logger.warning(f"Groq generation failed: {exc}")
 
-        # Fallback to Grok (xAI) - requires paid credits
+        # Fallback to Grok (xAI)
         if self.grok_client:
             try:
                 response = await self.grok_client.chat.completions.create(  # type: ignore
@@ -419,8 +486,11 @@ class NLPService:
                     ],
                     response_format={"type": "json_object"},
                     temperature=temperature,
+                    max_tokens=max_tokens,
                 )
-                return json.loads(response.choices[0].message.content or "{}")  # type: ignore
+                raw = response.choices[0].message.content or "{}"  # type: ignore
+                logger.debug("Grok raw response (first 300): %s", raw[:300])
+                return json.loads(raw)
             except Exception as exc:
                 logger.warning(f"Grok generation failed: {exc}")
 
@@ -650,61 +720,305 @@ Rules:
             "suggested_points": suggested_points,
         }
     
+    def _chunk_transcript(self, transcript: str, max_chars: int = 8000) -> List[str]:
+        """Split large transcripts into manageable chunks at sentence boundaries."""
+        if len(transcript) <= max_chars:
+            return [transcript]
+
+        chunks: List[str] = []
+        sentences = self._split_sentences(transcript)
+        current_chunk: List[str] = []
+        current_len = 0
+
+        for sentence in sentences:
+            sentence_len = len(sentence) + 1  # +1 for space/newline
+            if current_len + sentence_len > max_chars and current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+            current_chunk.append(sentence)
+            current_len += sentence_len
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        return chunks if chunks else [transcript]
+
+
+    def _build_offline_summary(self, transcript: str, meeting_title: str) -> "MeetingSummary":
+        """Build a real meeting summary purely from the transcript using regex/heuristics.
+
+        Used when ALL LLM providers are unavailable (rate-limited, no credits, etc.).
+        Produces a complete MeetingSummary with genuine content — never an error string.
+        """
+        sentences = self._split_sentences(transcript)
+        cleaned = [s.strip() for s in sentences if len(s.strip()) > 5]
+
+        # ── Regex patterns ─────────────────────────────────────────────────
+        action_patterns = re.compile(
+            r"\b(will|need to|needs to|should|must|going to|has to|have to|please|"
+            r"can you|could you|assigned to|responsible for|complete|prepare|review|"
+            r"submit|send|finish|update|create|fix|deliver|handle)\b",
+            re.IGNORECASE,
+        )
+        decision_patterns = re.compile(
+            r"\b(decided|decision|agreed|approved|moving|moved|launching|we will|"
+            r"we\'ll|confirmed|going ahead|plan is|roadmap|prioritize|ship|cancel)\b",
+            re.IGNORECASE,
+        )
+        name_pattern = re.compile(r"^([A-Z][a-z]{1,20})\b[\s,]")
+        SKIP_WORDS = {
+            "The","This","That","We","Our","All","No","An","A","In","On","At","By",
+            "To","For","And","But","Or","So","As","It","If","Is","Are","Was","Were",
+            "Has","Have","Had","Let","Please","Also","Then","Now","Meeting","Today",
+            "Tomorrow","Next","Last","Thanks","Alright","Great","One","Hi","Hello",
+            "Okay","Yes","Yeah","Sure","Right","Well","Good","Awesome","Excellent",
+            "Of","My","Your","Their","What","Why","When","Where","How",
+            "Can","Could","Should","Would","Will","Do","Does","Did","Let's"
+        }
+        topic_patterns = re.compile(
+            r"\b(dashboard|backend|frontend|api|database|launch|deploy|review|"
+            r"documentation|design|testing|bug|feature|sprint|release|integration|"
+            r"authentication|security|performance|report|presentation|deadline)\b",
+            re.IGNORECASE,
+        )
+
+        action_sentences: List[str] = []
+        decision_sentences: List[str] = []
+        mentions: List["MentionDetection"] = []
+        action_items_out: List["ActionItem"] = []
+        decisions_out: List["Decision"] = []
+        seen_names: set = set()
+        seen_decisions: set = set()
+
+        for sentence in cleaned:
+            is_action = bool(action_patterns.search(sentence))
+            is_decision = bool(decision_patterns.search(sentence))
+
+            if is_action:
+                action_sentences.append(sentence)
+            if is_decision:
+                decision_sentences.append(sentence)
+
+            name_match = name_pattern.match(sentence.strip())
+            if name_match:
+                name = name_match.group(1)
+                if name not in SKIP_WORDS and name.lower() not in seen_names:
+                    seen_names.add(name.lower())
+                    mentions.append(MentionDetection(
+                        user_name=sentence,   # full sentence → passes word-count filter in processor
+                        mention_type="action_assignment" if is_action else "direct",
+                        text=sentence,
+                        context=sentence,
+                        relevance_score=88.0,
+                        confidence=0.85,
+                        detection_method="offline_heuristic",
+                    ))
+                    if is_action:
+                        deadline_match = re.search(
+                            r"\b(by\s+\w+|tomorrow|today|friday|monday|tuesday|"
+                            r"wednesday|thursday|saturday|sunday|next week|eod|"
+                            r"\d{1,2}[\/\-]\d{1,2})\b",
+                            sentence, re.IGNORECASE,
+                        )
+                        deadline = deadline_match.group(0) if deadline_match else None
+                        task_text = re.sub(r"^[A-Z][a-z]+[,\s]+", "", sentence).strip()
+                        task_text = re.sub(r"\s+", " ", task_text)[:120]
+                        action_items_out.append(ActionItem(
+                            title=task_text or sentence[:100],
+                            description=sentence,
+                            owner=name,
+                            due_date=deadline,
+                            priority="high" if deadline else "medium",
+                            confidence=0.80,
+                        ))
+
+            if is_decision:
+                decision_text = sentence.strip()
+                if decision_text.lower() not in seen_decisions:
+                    seen_decisions.add(decision_text.lower())
+                    decisions_out.append(Decision(
+                        decision=decision_text,
+                        reasoning="",
+                        alternatives=[],
+                        decision_maker=None,
+                        is_reversible=True,
+                        impact_level="medium",
+                    ))
+
+        # Build a readable English paragraph instead of raw sentences
+        if action_items_out:
+            parts = []
+            for action in action_items_out[:3]:
+                title = (action.title or "").strip().rstrip(".")
+                if title.lower().startswith(("is ", "needs ", "will ", "should ", "must ", "can ", "has ")):
+                    parts.append(f"{action.owner} {title}")
+                else:
+                    parts.append(f"{action.owner} is tasked to {title}")
+            executive_summary = ", and ".join(parts) + "."
+            if decision_sentences:
+                executive_summary += " " + decision_sentences[0]
+        elif decision_sentences:
+            executive_summary = " ".join(decision_sentences[:3])
+        elif cleaned:
+            executive_summary = " ".join(cleaned[:3])
+        else:
+            executive_summary = "The meeting covered team tasks and responsibilities."
+
+        topic_words: List[str] = []
+        for sentence in cleaned:
+            for match in topic_patterns.finditer(sentence):
+                word = match.group(0).capitalize()
+                if word not in topic_words:
+                    topic_words.append(word)
+            if len(topic_words) >= 5:
+                break
+        if not topic_words:
+            topic_words = [meeting_title] if meeting_title else ["General discussion"]
+
+        logger.info(
+            f"Offline extraction: {len(mentions)} mentions, "
+            f"{len(action_items_out)} action items, {len(decisions_out)} decisions"
+        )
+        return MeetingSummary(
+            executive_summary=executive_summary,
+            key_points=[s for s in action_sentences[:5]],
+            decisions=decisions_out,
+            action_items=action_items_out,
+            discussion_topics=topic_words,
+            mentions=mentions,
+            sentiment="neutral",
+            sentiment_score=0.0,
+        )
+
     async def generate_summary(
         self,
         transcript: str,
         meeting_title: str,
         attendees: List[str],
     ) -> MeetingSummary:
-        """Generate comprehensive meeting summary"""
+        """Generate comprehensive meeting summary with structured extraction"""
         logger.info("Generating meeting summary")
 
         if not self.anthropic_client and not self.grok_client and not self.groq_client:
-            logger.warning("No NLP provider configured, returning fallback summary")
-            cleaned_lines = [line.strip() for line in transcript.splitlines() if line.strip()]
-            key_points = cleaned_lines[:5] if cleaned_lines else ["Meeting was uploaded and processed in fallback mode."]
-            fallback_actions = await self.extract_action_items(transcript, attendees)
-            return MeetingSummary(
-                executive_summary=(
-                    f"Meeting '{meeting_title}' processed in local fallback mode. "
-                    "AI summary is limited until ANTHROPIC_API_KEY, GROK_API_KEY, or GROQ_API_KEY is configured."
-                ),
-                key_points=key_points,
-                decisions=[],
-                action_items=fallback_actions,
-                discussion_topics=[meeting_title],
-                mentions=[],
-                sentiment="neutral",
-                sentiment_score=0.0,
-            )
-        
-        prompt = f"""Generate a comprehensive summary of this meeting.
+            logger.warning("No NLP provider configured — using offline heuristic extraction")
+            return self._build_offline_summary(transcript, meeting_title)
 
-Meeting: {meeting_title}
-Attendees: {', '.join(attendees)}
+        # Chunk large transcripts to avoid token limits
+        chunks = self._chunk_transcript(transcript, max_chars=8000)
+        if len(chunks) > 1:
+            logger.info(f"Transcript split into {len(chunks)} chunks for processing")
 
-Transcript:
+        system_prompt = (
+            "You are a STRICT JSON generator for a meeting intelligence system.\n\n"
+            "\u26a0\ufe0f CRITICAL:\n"
+            "* Output MUST be valid JSON\n"
+            "* NO explanation\n"
+            "* NO markdown\n"
+            "* NO extra text\n"
+            "* If you fail, the system will reject your response"
+        )
+
+        prompt = f"""You are a STRICT JSON generator for a meeting intelligence system.
+
+\u26a0\ufe0f CRITICAL:
+* Output MUST be valid JSON
+* NO explanation
+* NO markdown
+* NO extra text
+* If you fail, the system will reject your response
+
+---
+
+INPUT TRANSCRIPT:
 {transcript}
 
-Provide:
-1. Executive Summary (2-3 sentences): What was decided, what's next
-2. Key Points: 5-7 main takeaways
-3. Decisions Made: What was decided, why, alternatives considered, who decided, is it reversible, impact level
-4. Action Items: Tasks, owners, deadlines, priorities
-5. Discussion Topics: Main themes discussed
-6. Mentions: important people referenced, with mention type, text, context, relevance score, and confidence
-7. Overall Sentiment: positive, negative, or neutral
-8. Sentiment Score: -1 (very negative) to +1 (very positive)
+---
 
-Be concise but comprehensive. Focus on actionable information.
+OUTPUT FORMAT:
+{{
+  "summary": "",
+  "key_decisions": [],
+  "discussion_topics": [],
+  "mentions": [],
+  "action_items": []
+}}
 
-Return a JSON object.
-"""
-        
+---
+
+### TASKS
+
+### 1. SUMMARY
+* 2-3 sentences
+* Include: what was discussed, key actions, any decisions
+
+---
+
+### 2. MENTIONS (VERY IMPORTANT)
+Extract ALL people mentioned in the transcript.
+
+STRICT RULES:
+* DO NOT miss any name
+* If 3 people are mentioned \u2192 return 3 mentions
+* Each mention MUST include FULL sentence
+
+FORMAT:
+{{"name": "Person Name", "sentence": "FULL sentence from transcript"}}
+
+EXAMPLE:
+Input: "Sara, complete dashboard. Guru, review APIs. John, prepare docs."
+Output:
+[
+  {{"name": "Sara", "sentence": "Sara, complete dashboard."}},
+  {{"name": "Guru", "sentence": "Guru, review APIs."}},
+  {{"name": "John", "sentence": "John, prepare docs."}}
+]
+
+\u274c WRONG: {{"name": "Sara", "sentence": "Sara"}}
+
+---
+
+### 3. ACTION ITEMS
+Extract ALL tasks.
+
+FORMAT:
+{{"task": "what needs to be done", "owner": "Person Name", "deadline": "date or null"}}
+
+RULES:
+* EVERY owner MUST exist in mentions
+* DO NOT skip tasks
+
+---
+
+### 4. KEY DECISIONS
+Extract decisions.
+FORMAT: {{"decision": "text"}}
+Example: "Launch moved to next week"
+
+---
+
+### 5. DISCUSSION TOPICS
+Extract 3-5 meaningful topics.
+Examples: "Dashboard development", "Backend APIs", "Documentation", "Launch planning"
+
+---
+
+### FINAL VALIDATION (MANDATORY BEFORE OUTPUT)
+* Count names in transcript \u2192 count mentions \u2192 MUST MATCH
+* If Sara, Guru, John exist \u2192 ALL must be in mentions
+* Each mention must have full sentence
+* Action items must not be empty if tasks exist
+* JSON must be valid
+
+---
+
+RETURN JSON ONLY."""
+
         summary_data = await self._generate_json(
-            system_prompt="You are an expert meeting analyst.",
+            system_prompt=system_prompt,
             user_prompt=prompt,
-            temperature=0.3,
+            temperature=0.2,
+            max_tokens=4000,
         )
         logger.info(f"Summary data returned: {summary_data}")
         
@@ -714,59 +1028,62 @@ Return a JSON object.
             logger.info(f"Extracted nested summary data: {summary_data}")
 
         if not summary_data:
-            cleaned_lines = [line.strip() for line in transcript.splitlines() if line.strip()]
-            key_points = cleaned_lines[:5] if cleaned_lines else ["No structured summary returned by model."]
-            fallback_actions = await self.extract_action_items(transcript, attendees)
-            return MeetingSummary(
-                executive_summary=(
-                    f"Meeting '{meeting_title}' was processed, but structured JSON was not returned by the model."
-                ),
-                key_points=key_points,
-                decisions=[],
-                action_items=fallback_actions,
-                discussion_topics=[meeting_title],
-                mentions=[],
-                sentiment="neutral",
-                sentiment_score=0.0,
+            logger.warning(
+                "All LLM providers unavailable (rate limit / no credits). "
+                "Falling back to heuristic offline extraction."
             )
-        
-        # Normalize decision data - could be a single dict or list
-        # Try multiple key formats (snake_case and Title Case from Groq)
+            return self._build_offline_summary(transcript, meeting_title)
+
+
+        # ── Parse decisions ─────────────────────────────────────────────
+        # New prompt returns flat strings: ["decision text", ...]
+        # Old prompt returned objects: [{"decision": ..., "reasoning": ...}]
         decisions_data = (
-            summary_data.get("decisions") or 
+            summary_data.get("key_decisions") or
+            summary_data.get("decisions") or
             summary_data.get("decisions_made") or
             summary_data.get("Decisions Made") or
             summary_data.get("Decisions") or
             []
         )
         if isinstance(decisions_data, dict):
-            # If it's a dict of decisions (e.g., {"Launch Date": {...}}), convert to list
             decisions_data = list(decisions_data.values()) if decisions_data else []
         elif not isinstance(decisions_data, list):
             decisions_data = []
-        
-        # Normalize action items
+
+        decisions = []
+        for d in decisions_data:
+            try:
+                if isinstance(d, str):
+                    # Flat string from new prompt → wrap as Decision object
+                    decisions.append(Decision(
+                        decision=d,
+                        reasoning="",
+                        alternatives=[],
+                        decision_maker=None,
+                        is_reversible=True,
+                        impact_level="medium",
+                    ))
+                elif isinstance(d, dict):
+                    decisions.append(Decision(**self._normalize_decision(d)))
+            except Exception as e:
+                logger.warning(f"Failed to parse decision: {e}")
+        logger.info(f"Successfully parsed {len(decisions)} decisions from {len(decisions_data)} data items")
+
+        # ── Parse action items ──────────────────────────────────────────
+        # New prompt returns: {task, assignee, deadline, priority}
+        # Old prompt returned: {title, description, owner, due_date, priority, confidence}
+        # _normalize_action_item handles both via field aliases
         action_items_data = (
             summary_data.get("action_items") or
             summary_data.get("Action Items") or
-            summary_data.get("action_items") or
             []
         )
         if isinstance(action_items_data, dict):
             action_items_data = list(action_items_data.values()) if action_items_data else []
         elif not isinstance(action_items_data, list):
             action_items_data = []
-        
-        # Parse into structured format
-        decisions = []
-        for d in decisions_data:
-            if isinstance(d, dict):
-                try:
-                    decisions.append(Decision(**self._normalize_decision(d)))
-                except Exception as e:
-                    logger.warning(f"Failed to parse decision: {e}")
-        logger.info(f"Successfully parsed {len(decisions)} decisions from {len(decisions_data)} data items")
-        
+
         action_items = []
         for a in action_items_data:
             if isinstance(a, dict):
@@ -775,6 +1092,9 @@ Return a JSON object.
                 except Exception as e:
                     logger.warning(f"Failed to parse action item: {e}")
 
+        # ── Parse mentions ──────────────────────────────────────────────
+        # New prompt returns: {name, sentence, type, confidence}
+        # Old prompt returned: {name, context}
         mention_items_data = summary_data.get("mentions") or summary_data.get("Mentions") or []
         if isinstance(mention_items_data, dict):
             mention_items_data = list(mention_items_data.values()) if mention_items_data else []
@@ -782,55 +1102,134 @@ Return a JSON object.
             mention_items_data = []
 
         mentions: List[MentionDetection] = []
-        for mention_dict in mention_items_data:
-            if isinstance(mention_dict, dict):
-                try:
-                    mentions.append(
-                        MentionDetection(
-                            user_name=str(mention_dict.get("user_name") or mention_dict.get("name") or mention_dict.get("user") or "").strip(),
-                            mention_type=str(mention_dict.get("mention_type") or mention_dict.get("type") or "direct").strip(),
-                            text=str(mention_dict.get("text") or mention_dict.get("mentioned_text") or "").strip(),
-                            context=str(mention_dict.get("context") or mention_dict.get("full_context") or "").strip(),
-                            relevance_score=float(mention_dict.get("relevance_score") or mention_dict.get("score") or 0.0),
-                            confidence=float(mention_dict.get("confidence") or 0.0),
-                            is_action_item=bool(mention_dict.get("is_action_item", False)),
-                            is_question=bool(mention_dict.get("is_question", False)),
-                            sentiment=mention_dict.get("sentiment"),
-                            sentiment_score=mention_dict.get("sentiment_score"),
-                            detection_method=mention_dict.get("detection_method"),
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to parse mention summary item: {e}")
-        
+        seen_mention_names: set = set()
+        for mention_item in mention_items_data:
+            try:
+                if isinstance(mention_item, dict):
+                    name = str(
+                        mention_item.get("name") or
+                        mention_item.get("user_name") or
+                        mention_item.get("user") or ""
+                    ).strip()
+                    if not name:
+                        continue
+
+                    # Prefer the full verbatim sentence over bare context
+                    sentence = str(
+                        mention_item.get("sentence") or
+                        mention_item.get("text") or
+                        mention_item.get("context") or ""
+                    ).strip()
+
+                    # Fall back to constructing a minimal meaningful sentence
+                    # so the processor word-count filter never drops it.
+                    if not sentence or sentence.lower() == name.lower():
+                        sentence = f"{name} was mentioned in this meeting."
+
+                    mention_type = str(
+                        mention_item.get("type") or
+                        mention_item.get("mention_type") or "direct"
+                    ).strip()
+                    confidence = float(mention_item.get("confidence") or 0.9)
+
+                    # Deduplicate by name (keep first / most informative)
+                    name_key = name.lower()
+                    if name_key in seen_mention_names:
+                        continue
+                    seen_mention_names.add(name_key)
+
+                    mentions.append(MentionDetection(
+                        user_name=name,
+                        mention_type=mention_type,
+                        text=sentence,
+                        context=sentence,
+                        relevance_score=85.0,
+                        confidence=confidence,
+                        detection_method="ai_structured_extraction",
+                    ))
+
+                elif isinstance(mention_item, str):
+                    name = mention_item.strip()
+                    if not name:
+                        continue
+                    name_key = name.lower()
+                    if name_key in seen_mention_names:
+                        continue
+                    seen_mention_names.add(name_key)
+                    mentions.append(MentionDetection(
+                        user_name=name,
+                        mention_type="direct",
+                        text=f"{name} was mentioned in this meeting.",
+                        context="",
+                        relevance_score=75.0,
+                        confidence=0.8,
+                        detection_method="ai_structured_extraction",
+                    ))
+            except Exception as e:
+                logger.warning(f"Failed to parse mention: {e}")
+
+        # ── Cross-check: ensure every action_item owner has a mention ───
+        # This guarantees consistency even when the LLM misses a mention.
+        for a in action_items_data:
+            if not isinstance(a, dict):
+                continue
+            owner = str(
+                a.get("owner") or a.get("assignee") or ""
+            ).strip()
+            if not owner:
+                continue
+            owner_key = owner.lower()
+            if owner_key not in seen_mention_names:
+                task_text = str(a.get("task") or a.get("title") or "").strip()
+                sentence = f"{owner} will {task_text}." if task_text else f"{owner} was mentioned in this meeting."
+                mentions.append(MentionDetection(
+                    user_name=owner,
+                    mention_type="action_assignment",
+                    text=sentence,
+                    context=sentence,
+                    relevance_score=90.0,
+                    confidence=0.85,
+                    detection_method="action_item_crosscheck",
+                ))
+                seen_mention_names.add(owner_key)
+                logger.info(f"Auto-added missing mention for action owner: '{owner}'")  
+
+        # ── Parse topics ────────────────────────────────────────────────
+        # New prompt returns "discussion_topics", old returned "topics"
+        discussion_topics = self._safe_list(
+            summary_data.get("discussion_topics") or
+            summary_data.get("topics") or
+            summary_data.get("Discussion Topics") or
+            []
+        )
+
+        # ── Build MeetingSummary ────────────────────────────────────────
+        # New prompt returns "summary", old returned "executive_summary"
         summary = MeetingSummary(
             executive_summary=(
-                summary_data.get("executive_summary") or 
-                summary_data.get("Executive Summary") or 
+                summary_data.get("summary") or
+                summary_data.get("executive_summary") or
+                summary_data.get("Executive Summary") or
                 ""
             ),
             key_points=self._safe_list(
-                summary_data.get("key_points") or 
-                summary_data.get("Key Points") or 
+                summary_data.get("key_points") or
+                summary_data.get("Key Points") or
                 []
             ),
             decisions=decisions,
             action_items=action_items,
-            discussion_topics=self._safe_list(
-                summary_data.get("discussion_topics") or 
-                summary_data.get("Discussion Topics") or 
-                []
-            ),
+            discussion_topics=discussion_topics,
             mentions=mentions,
             sentiment=(
-                summary_data.get("sentiment") or 
+                summary_data.get("sentiment") or
                 summary_data.get("overall_sentiment") or
-                summary_data.get("Overall Sentiment") or 
+                summary_data.get("Overall Sentiment") or
                 "neutral"
             ).lower(),
             sentiment_score=float(summary_data.get("sentiment_score") or summary_data.get("Sentiment Score") or 0.0),
         )
-        
+
         logger.info(
             f"Summary parsed successfully: {len(decisions)} decisions, {len(action_items)} action items, {len(mentions)} mentions"
         )

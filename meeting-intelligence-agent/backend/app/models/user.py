@@ -20,6 +20,7 @@ class User(Base):
     username = Column(String(100), unique=True, nullable=False, index=True)
     full_name = Column(String(255), nullable=False)
     hashed_password = Column(String(255), nullable=False)
+    slack_user_id = Column(String(255), nullable=True)
     
     # Profile
     avatar_url = Column(String(500))

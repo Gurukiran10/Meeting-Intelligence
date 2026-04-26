@@ -114,7 +114,7 @@ services:
     ports:
       - "3002:3000"
     environment:
-      - VITE_API_PROXY_TARGET=http://host.docker.internal:8002
+      - VITE_API_PROXY_TARGET=http://backend:8000
     volumes:
       - ./frontend:/app
       - /app/node_modules

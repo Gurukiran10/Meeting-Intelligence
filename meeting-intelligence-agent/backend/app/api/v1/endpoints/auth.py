@@ -211,11 +211,36 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
-    user = db.execute(
-        select(User).where(User.username == form_data.username)
-    ).scalar_one_or_none()
+    try:
+        user = db.execute(
+            select(User).where(User.username == form_data.username)
+        ).scalar_one_or_none()
+        print("user:", user)
+    except Exception as exc:
+        print("login db error:", str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to process login right now",
+        )
 
-    if not user or not verify_password(form_data.password, user.hashed_password):
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        password_matches = verify_password(form_data.password, user.hashed_password)
+        print("password check:", password_matches)
+    except Exception as exc:
+        print("password verify error:", str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to process login right now",
+        )
+
+    if not password_matches:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -284,14 +309,30 @@ async def get_current_user(
 
     try:
         payload = decode_token(token)
-    except ValueError:
+        print("decoded token:", payload)
+    except ValueError as exc:
+        print("token decode error:", str(exc))
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
 
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
 
-    user = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    try:
+        user_lookup_id = UUID(str(user_id))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
+
+    try:
+        user = db.execute(select(User).where(User.id == user_lookup_id)).scalar_one_or_none()
+        print("user fetched:", user)
+    except Exception as exc:
+        print("get_current_user db error:", str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to load current user",
+        )
+
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 

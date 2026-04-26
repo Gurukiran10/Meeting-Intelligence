@@ -43,11 +43,17 @@ def create_refresh_token(data: Dict) -> str:
 
 def decode_token(token: str) -> Dict:
     """Decode and verify JWT token"""
+    secret_key = settings.JWT_SECRET_KEY or settings.SECRET_KEY
+    algorithm = settings.JWT_ALGORITHM or "HS256"
+
+    if not secret_key:
+        raise ValueError("Missing JWT secret key")
+
     try:
         payload = jwt.decode(
             token,
-            settings.JWT_SECRET_KEY,
-            algorithms=[settings.JWT_ALGORITHM],
+            secret_key,
+            algorithms=[algorithm],
         )
         return payload
     except JWTError:

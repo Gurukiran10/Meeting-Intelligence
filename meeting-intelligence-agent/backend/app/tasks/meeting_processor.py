@@ -12,6 +12,7 @@ from app.core.database import SessionLocal
 from app.services.ai.transcription import transcription_service
 from app.services.ai.nlp import nlp_service
 from app.services.integrations.slack import slack_service
+from app.services.slack_service import send_slack_dm
 from app.services.mentions import detect_and_store_mentions
 from app.services.notifications import create_notification
 from app.core.meeting_operations import (
@@ -22,6 +23,7 @@ from app.core.meeting_operations import (
 from app.models.meeting import Meeting
 from app.models.transcript import Transcript
 from app.models.action_item import ActionItem
+from app.models.mention import Mention
 from app.models.user import User
 from sqlalchemy import select
 
@@ -101,7 +103,12 @@ def process_meeting_recording_background(meeting_id: str | UUID, recording_path:
 
 
 async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  # type: ignore
-    """Async implementation of meeting processing"""
+    """Async implementation of meeting processing.
+
+    Uses two-phase error handling:
+    - CRITICAL: transcription, NLP summary, action items → failure = status "failed"
+    - NON-CRITICAL: mentions, Slack, Linear → failure is logged, does NOT fail the pipeline
+    """
     meeting = None
     normalized_meeting_id = _normalize_meeting_id(meeting_id)
     if not normalized_meeting_id:
@@ -109,29 +116,41 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
         return
 
     with SessionLocal() as db:
+        # ── Fetch meeting ────────────────────────────────────────────
         try:
-            # Get meeting
             result = db.execute(
                 select(Meeting).where(Meeting.id == normalized_meeting_id)
             )
             meeting = result.scalar_one_or_none()
-            
-            if not meeting:
-                logger.error(f"Meeting {meeting_id} not found")
-                return
-            
+        except Exception as e:
+            logger.error(f"Failed to fetch meeting {meeting_id}: {e}", exc_info=True)
+            return
+
+        if not meeting:
+            logger.error(f"Meeting {meeting_id} not found")
+            return
+
+        # ═══════════════════════════════════════════════════════════════
+        # PHASE 1 — CRITICAL: Transcription + NLP + Action Items
+        # If this fails, the meeting is marked as "failed".
+        # ═══════════════════════════════════════════════════════════════
+        summary = None
+        full_transcript = ""
+        candidate_users = []
+
+        try:
             # Step 1: Transcribe
             logger.info(f"Transcribing meeting {meeting_id}")
             meeting.transcription_status = "processing"  # type: ignore
             db.commit()
-            
+
             transcription = await transcription_service.transcribe_audio(
                 recording_path,
                 enable_diarization=True,
             )
             if not transcription.segments:
                 raise RuntimeError("Transcript is empty")
-            
+
             # Save transcripts
             for idx, segment in enumerate(transcription.segments):
                 transcript = Transcript(
@@ -145,25 +164,25 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                     confidence=segment.confidence,
                 )
                 db.add(transcript)
-            
+
             meeting.transcription_status = "completed"  # type: ignore
             db.commit()
-            
+
             # Step 2: Analyze with NLP
             logger.info(f"Analyzing meeting {meeting_id}")
             meeting.status = "processing"  # type: ignore
             meeting.analysis_status = "processing"  # type: ignore
             db.commit()
-            
+
             full_transcript = "\n".join([s.text for s in transcription.segments])
-            
-            # Generate summary
+
+            # Generate summary (core extraction)
             summary = await nlp_service.generate_summary(
                 full_transcript,
                 meeting.title,  # type: ignore[arg-type]
                 meeting.attendee_ids or [],  # type: ignore[arg-type]
             )
-            
+
             meeting.summary = summary.executive_summary  # type: ignore
             meeting.key_decisions = [d.model_dump() for d in summary.decisions]  # type: ignore
             meeting.discussion_topics = summary.discussion_topics  # type: ignore
@@ -175,9 +194,23 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                     User.organization_id == meeting.organization_id,
                 )
             ).scalars().all()
-            
+
             # Save action items
             for action_data in summary.action_items:
+                if not action_data.title:
+                    continue
+
+                # ── Dedup: skip if this task already exists for this meeting ──
+                existing_action = db.execute(
+                    select(ActionItem).where(
+                        ActionItem.meeting_id == meeting.id,
+                        ActionItem.title == action_data.title[:500],
+                    )
+                ).scalar_one_or_none()
+                if existing_action:
+                    logger.debug(f"Skipping duplicate action item: '{action_data.title}'")
+                    continue
+
                 owner = _match_user_by_name(candidate_users, action_data.owner)
                 action = ActionItem(
                     organization_id=meeting.organization_id,
@@ -211,11 +244,187 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                         },
                     )
 
-            # Step 2.5: Save personalized mentions for present or absent users
+            # Save mentions extracted by LLM (from summary.mentions)
+            # Maps each name to a real user via fuzzy matching.
+            # If no match → user_id = None (NOT organizer fallback).
+            logger.info(f"MENTIONS FROM LLM (raw): {[m.user_name for m in summary.mentions]}")
+            seen_mention_keys: set = set()
+            saved_mention_count = 0
+            for mention_data in summary.mentions:
+                # mention_data.text = full sentence (always)
+                # mention_data.user_name = short name (LLM) OR full sentence (offline path)
+                mention_text = (mention_data.text or mention_data.user_name or "").strip()
+                if not mention_text:
+                    continue
+
+                # Derive the short person name for user-matching and display
+                # If user_name looks like a single capitalized word → it IS the name
+                # If user_name is a full sentence (offline path) → extract first word
+                raw_name = (mention_data.user_name or "").strip()
+                if len(raw_name.split()) == 1 and raw_name[0].isupper():
+                    person_name = raw_name          # LLM gave us bare "Sara"
+                else:
+                    # Extract first capitalized word from the sentence
+                    m = re.match(r"([A-Z][a-z]+)", mention_text)
+                    person_name = m.group(1) if m else raw_name.split()[0]
+
+                # ── Filter: skip if we have NO actionable sentence ────────
+                # Require the stored text to be more than a bare name (>1 word)
+                if len(mention_text.split()) <= 1:
+                    logger.debug(f"Skipping weak mention (single word): '{mention_text}'")
+                    continue
+
+                # Use the full sentence as the stored mention text
+                mention_name = mention_text
+
+                # ── Deduplicate by normalised sentence ────────────────────
+                name_key = re.sub(r"\s+", " ", mention_name.lower())
+                if name_key in seen_mention_keys:
+                    continue
+                seen_mention_keys.add(name_key)
+
+                matched_user = _match_user_by_name(candidate_users, person_name)
+                mention_user_id = matched_user.id if matched_user else None
+
+
+                # ── DB-level duplicate guard ───────────────────────────
+                dedup_filters = [
+                    Mention.meeting_id == meeting.id,
+                    Mention.mentioned_text == mention_name[:1000],
+                    Mention.detection_method == "ai_structured_extraction",
+                ]
+                if mention_user_id is not None:
+                    dedup_filters.append(Mention.user_id == mention_user_id)
+                else:
+                    dedup_filters.append(Mention.user_id.is_(None))
+                existing = db.execute(
+                    select(Mention).where(*dedup_filters)
+                ).scalar_one_or_none()
+                if existing:
+                    continue
+
+                mention = Mention(
+                    organization_id=meeting.organization_id,
+                    meeting_id=meeting.id,
+                    user_id=mention_user_id,
+                    mention_type=mention_data.mention_type or "direct",
+                    mentioned_text=mention_name[:1000],
+                    full_context=(mention_data.context or "")[:2000],
+                    context_before=(mention_data.context or "")[:900] if mention_data.context else None,
+                    relevance_score=float(getattr(mention_data, "relevance_score", 80.0)),
+                    confidence=float(getattr(mention_data, "confidence", 0.9)),
+                    detection_method="ai_structured_extraction",
+                    mention_metadata={
+                        "extracted_name": mention_name,
+                        "matched_to_user": matched_user.full_name if matched_user else None,
+                        "source": "llm_summary_extraction",
+                    },
+                )
+                db.add(mention)
+                db.flush()
+                saved_mention_count += 1
+
+                # ── TASK 3/4: Only notify the matched user ─────────────
+                if not matched_user:
+                    logger.info(f"Saved mention: '{mention_name}' → no matching user (user_id=None)")
+                    continue
+
+                logger.info(
+                    f"Saved mention: '{mention_name}' → "
+                    f"matched user '{matched_user.full_name}' (id={matched_user.id})"
+                )
+
+                # Build a rich notification message
+                user_tasks = [
+                    a for a in summary.action_items
+                    if a.owner in {matched_user.full_name, person_name}
+                ]
+                message = (
+                    f"👋 You were mentioned in a meeting\n\n"
+                    f"📌 Meeting: {meeting.title}\n"
+                    f"📎 View: http://localhost:3002/meetings/{meeting.id}\n"
+                )
+                if user_tasks:
+                    task = user_tasks[0]
+                    message += f"\n📌 Task: {task.title}"
+                    if getattr(task, "due_date", None):
+                        message += f"\n⏰ Deadline: {task.due_date}"
+
+                notification_meta = {
+                    "mention_id": str(mention.id),
+                    "meeting_id": str(meeting.id),
+                    "mention_type": mention_data.mention_type or "direct",
+                    "source": "ai_extraction",
+                }
+
+                # ── TASK 2: ALWAYS create in-app (bell) notification ──
+                # Then additionally fire Slack DM if the user has it
+                # connected.  This means the bell icon is ALWAYS populated
+                # regardless of Slack status.
+                create_notification(
+                    db,
+                    user_id=matched_user.id,
+                    organization_id=meeting.organization_id,
+                    notification_type="mention",
+                    message=message,
+                    notification_metadata=notification_meta,
+                )
+
+                if matched_user.slack_user_id:
+                    send_slack_dm(matched_user.slack_user_id, message)
+
+            logger.info(f"Saved {saved_mention_count} quality mentions from LLM extraction (raw count: {len(summary.mentions)})")
+
+            # ── CRITICAL PHASE SUCCEEDED → mark completed ────────────
+            meeting.analysis_status = "completed"  # type: ignore
+            meeting.transcription_status = "completed"  # type: ignore
+            meeting.status = "completed"  # type: ignore
+            db.commit()
+            logger.info(f"Meeting {meeting_id} core processing completed successfully")
+
+        except Exception as e:
+            # ── CRITICAL PHASE FAILED → mark as failed ───────────────
+            logger.error(f"CRITICAL ERROR processing meeting {meeting_id}: {e}", exc_info=True)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            try:
+                result = db.execute(select(Meeting).where(Meeting.id == normalized_meeting_id))
+                failed_meeting = result.scalar_one_or_none()
+                if failed_meeting:
+                    failed_meeting.transcription_status = "failed"  # type: ignore
+                    failed_meeting.analysis_status = "failed"  # type: ignore
+                    failed_meeting.status = "failed"  # type: ignore
+                    failed_meeting.meeting_metadata = {
+                        **(failed_meeting.meeting_metadata or {}),
+                        "last_error": str(e),
+                        "failed_at": datetime.utcnow().isoformat(),
+                    }  # type: ignore
+                    db.commit()
+            except Exception as status_error:
+                logger.error(
+                    f"Failed to persist failed status for meeting {meeting_id}: {status_error}",
+                    exc_info=True,
+                )
+            return  # Stop here — don't run non-critical steps
+
+        # ═══════════════════════════════════════════════════════════════
+        # PHASE 2 — NON-CRITICAL: Mentions, Slack, Linear
+        # Each step is individually wrapped. Failures are logged but
+        # do NOT change meeting status or roll back saved data.
+        # ═══════════════════════════════════════════════════════════════
+
+        organizer = None
+        try:
             organizer = db.execute(
                 select(User).where(User.id == meeting.organizer_id)
             ).scalar_one_or_none()
+        except Exception as e:
+            logger.warning(f"ERROR fetching organizer for meeting {meeting_id}: {e}")
 
+        # Step 2.5: Mentions extraction (non-critical)
+        try:
             await detect_and_store_mentions(
                 db=db,
                 meeting=meeting,
@@ -223,20 +432,19 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                 candidate_users=candidate_users,
                 send_real_time_alerts=True,
                 meeting_context={
-                    "meeting_summary": summary.executive_summary,
-                    "discussion_topics": summary.discussion_topics,
+                    "meeting_summary": summary.executive_summary if summary else "",
+                    "discussion_topics": summary.discussion_topics if summary else [],
                 },
             )
-            
-            meeting.analysis_status = "completed"  # type: ignore
-            meeting.transcription_status = "completed"  # type: ignore
-            meeting.status = "completed"  # type: ignore
-            db.commit()
+            logger.info(f"Mentions extraction completed for meeting {meeting_id}")
+        except Exception as e:
+            logger.warning(f"ERROR in mentions extraction for meeting {meeting_id} (non-fatal): {e}", exc_info=True)
 
-            # Step 3: Send Slack notification (if organizer has Slack connected)
-            if organizer:
-                slack_creds = (organizer.integrations or {}).get("slack", {})
-                if slack_creds.get("bot_token"):
+        # Step 3: Slack notification (non-critical)
+        if organizer and summary:
+            slack_creds = (organizer.integrations or {}).get("slack", {})
+            if slack_creds.get("bot_token"):
+                try:
                     channel = slack_creds.get("default_channel", "#general")
                     notification = get_or_create_notification_tracking(
                         db=db,
@@ -296,48 +504,24 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                                 response_status="500",
                             )
                             logger.warning(f"Slack notification failed (non-fatal): {slack_err}")
+                except Exception as e:
+                    logger.warning(f"ERROR in Slack setup for meeting {meeting_id} (non-fatal): {e}")
 
-            # Step 4: Create Linear issues for action items (if organizer has Linear connected)
-            if organizer and summary.action_items:
-                linear_creds = (organizer.integrations or {}).get("linear", {})
-                if linear_creds.get("api_key"):
-                    try:
-                        logger.info(f"Creating Linear issues for meeting {meeting_id}")
-                        await _create_linear_issues(
-                            api_key=linear_creds["api_key"],
-                            meeting_title=str(meeting.title),
-                            action_items=summary.action_items,
-                        )
-                    except Exception as linear_err:
-                        logger.warning(f"Linear sync failed (non-fatal): {linear_err}")
-
-            logger.info(f"Meeting {meeting_id} processing completed successfully")
-            
-        except Exception as e:
-            logger.error(f"Error processing meeting {meeting_id}: {e}", exc_info=True)
-            if meeting:
+        # Step 4: Linear issues (non-critical)
+        if organizer and summary and summary.action_items:
+            linear_creds = (organizer.integrations or {}).get("linear", {})
+            if linear_creds.get("api_key"):
                 try:
-                    db.rollback()
-                except Exception:
-                    pass
-                try:
-                    result = db.execute(select(Meeting).where(Meeting.id == normalized_meeting_id))
-                    failed_meeting = result.scalar_one_or_none()
-                    if failed_meeting:
-                        failed_meeting.transcription_status = "failed"  # type: ignore
-                        failed_meeting.analysis_status = "failed"  # type: ignore
-                        failed_meeting.status = "failed"  # type: ignore
-                        failed_meeting.meeting_metadata = {
-                            **(failed_meeting.meeting_metadata or {}),
-                            "last_error": str(e),
-                            "failed_at": datetime.utcnow().isoformat(),
-                        }  # type: ignore
-                        db.commit()
-                except Exception as status_error:
-                    logger.error(
-                        f"Failed to persist failed status for meeting {meeting_id}: {status_error}",
-                        exc_info=True,
+                    logger.info(f"Creating Linear issues for meeting {meeting_id}")
+                    await _create_linear_issues(
+                        api_key=linear_creds["api_key"],
+                        meeting_title=str(meeting.title),
+                        action_items=summary.action_items,
                     )
+                except Exception as linear_err:
+                    logger.warning(f"Linear sync failed (non-fatal): {linear_err}")
+
+        logger.info(f"Meeting {meeting_id} processing pipeline finished")
 
 
 @shared_task(name="send_action_reminders")

@@ -60,15 +60,23 @@ const MeetingDetail: React.FC = () => {
     { enabled: Boolean(id) },
   )
 
-  const meetingActionItems = useMemo(
-    () => (allActionItems || []).filter((item: any) => item.meeting_id === id),
-    [allActionItems, id],
-  )
+  const meetingActionItems = useMemo(() => {
+    // Prefer inline action items from API (meeting-scoped, not user-scoped)
+    if (Array.isArray(meeting?.action_items) && meeting.action_items.length > 0) {
+      return meeting.action_items
+    }
+    // Fallback to filtered global list
+    return (allActionItems || []).filter((item: any) => item.meeting_id === id)
+  }, [meeting?.action_items, allActionItems, id])
 
-  const meetingMentions = useMemo(
-    () => (allMentions || []).filter((mention: any) => mention.meeting_id === id),
-    [allMentions, id],
-  )
+  const meetingMentions = useMemo(() => {
+    // Prefer inline mentions from API (meeting-scoped, not user-scoped)
+    if (Array.isArray(meeting?.mentions) && meeting.mentions.length > 0) {
+      return meeting.mentions
+    }
+    // Fallback to filtered global list
+    return (allMentions || []).filter((mention: any) => mention.meeting_id === id)
+  }, [meeting?.mentions, allMentions, id])
 
   const decisions = Array.isArray(meeting?.key_decisions) ? meeting.key_decisions : []
   const topics = Array.isArray(meeting?.discussion_topics) ? meeting.discussion_topics : []

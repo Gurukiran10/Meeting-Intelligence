@@ -421,7 +421,7 @@ const Meetings: React.FC = () => {
                     </Link>
                     <p className="mt-1 text-sm text-gray-500">{meeting.description}</p>
                     <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-gray-500">
-                      <span>{new Date(meeting.scheduled_start).toLocaleDateString()}</span>
+                      <span>{new Date(meeting.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })}</span>
                       <span>{meeting.platform}</span>
                       <span>{meeting.attendee_count ?? meeting.attendee_ids?.length ?? 0} attendees</span>
                       <span className={`px-2 py-1 rounded-full text-xs ${
