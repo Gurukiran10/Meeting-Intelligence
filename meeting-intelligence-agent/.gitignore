@@ -31,10 +31,11 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 
-# Uploads
+# Uploads & bot debug artifacts
 uploads/
 recordings/
 temp/
+backend/debug/
 
 # Logs
 *.log
