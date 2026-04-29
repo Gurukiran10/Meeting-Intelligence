@@ -1,16 +1,21 @@
 """
 Authentication Endpoints
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 from typing import Optional
 from uuid import UUID
+from urllib.parse import urlencode
 
+import httpx
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
+from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+from app.core.config import settings
 
 from app.core.database import get_db
 from app.core.security import (
@@ -376,3 +381,177 @@ async def get_organization_by_slug(
     if not organization:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
     return organization
+
+
+# ─── Google OAuth ─────────────────────────────────────────────────────────────
+
+async def get_valid_google_token(user: User, db: Session) -> str:
+    """Return a valid access token, refreshing via stored credentials if expired."""
+    if not user.google_connected or not user.google_refresh_token:
+        raise HTTPException(status_code=400, detail="Google not connected for this user")
+
+    if (
+        user.google_access_token
+        and user.google_token_expiry
+        and user.google_token_expiry > datetime.utcnow() + timedelta(seconds=60)
+    ):
+        return user.google_access_token
+
+    google = (user.integrations or {}).get("google", {})
+    client_id = google.get("client_id") or settings.GOOGLE_CLIENT_ID
+    client_secret = google.get("client_secret") or settings.GOOGLE_CLIENT_SECRET
+
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="Google OAuth credentials not stored; reconnect Google")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": user.google_refresh_token,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Google token refresh failed: {resp.text}")
+
+    data = resp.json()
+    user.google_access_token = data["access_token"]
+    user.google_token_expiry = datetime.utcnow() + timedelta(seconds=data.get("expires_in", 3600) - 30)
+    db.commit()
+    return user.google_access_token
+
+
+import logging as _logger
+_log = _logger.getLogger(__name__)
+
+
+class GoogleLoginRequest(BaseModel):
+    client_id: str
+
+
+@router.post("/google/login")
+async def google_login(
+    req: GoogleLoginRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    redirect_uri = settings.GOOGLE_REDIRECT_URI
+    if not redirect_uri:
+        raise HTTPException(status_code=500, detail="GOOGLE_REDIRECT_URI not configured in backend/.env")
+
+    # Persist client_id so the callback can retrieve it without JWT
+    import copy
+    integrations = copy.deepcopy(current_user.integrations or {})
+    integrations.setdefault("google", {})["client_id"] = req.client_id
+    current_user.integrations = integrations
+    db.commit()
+
+    params = {
+        "client_id": req.client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,           # always backend URL from env
+        "scope": "openid email profile https://www.googleapis.com/auth/calendar.readonly",
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": str(current_user.id),
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    _log.info(f"[Google OAuth login] user={current_user.id} redirect_uri={redirect_uri}")
+    return {"auth_url": auth_url}
+
+
+@router.get("/google/callback")
+async def google_callback(
+    code: str,
+    state: str,
+    db: Session = Depends(get_db),
+):
+    """Browser redirect from Google — no JWT required, user identified via state."""
+    import copy
+
+    user = db.execute(select(User).where(User.id == state)).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    client_secret = (settings.GOOGLE_CLIENT_SECRET or "").strip()
+    if not client_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="Server misconfigured: GOOGLE_CLIENT_SECRET missing. Set it in backend/.env and restart.",
+        )
+
+    google = (user.integrations or {}).get("google", {})
+    client_id = (google.get("client_id") or settings.GOOGLE_CLIENT_ID or "").strip()
+    redirect_uri = (settings.GOOGLE_REDIRECT_URI or "").strip()
+
+    masked_secret = client_secret[:4] + "****" + client_secret[-4:] if len(client_secret) >= 8 else "****"
+    masked_id = client_id[:8] + "..." + client_id[-8:] if len(client_id) >= 16 else client_id
+    _log.info(
+        f"[Google OAuth callback] user={user.id} "
+        f"client_id={masked_id} (len={len(client_id)}) "
+        f"client_secret={masked_secret} (len={len(client_secret)}) "
+        f"redirect_uri={redirect_uri}"
+    )
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+            },
+        )
+
+    _log.info(f"[Google OAuth callback] token exchange status={token_resp.status_code}")
+
+    if token_resp.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Google token exchange failed: {token_resp.text}")
+
+    token_data = token_resp.json()
+    access_token = token_data["access_token"]
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in", 3600)
+
+    async with httpx.AsyncClient() as client:
+        info_resp = await client.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    google_email = info_resp.json().get("email") if info_resp.status_code == 200 else None
+
+    expiry_dt = datetime.utcnow() + timedelta(seconds=expires_in - 30)
+    expiry_iso = expiry_dt.replace(microsecond=0).isoformat()
+
+    # Write to dedicated DB columns (used by auth.get_valid_google_token)
+    user.google_access_token = access_token
+    if refresh_token:
+        user.google_refresh_token = refresh_token
+    user.google_token_expiry = expiry_dt
+    user.google_email = google_email
+    user.google_connected = True
+
+    # ALSO write to user.integrations["google"] so all integration endpoints
+    # (_get_google_access_token, test_google, sync, calendar fetch) can read them.
+    integrations = copy.deepcopy(user.integrations or {})
+    google = integrations.get("google", {})
+    google["access_token"] = access_token
+    google["refresh_token"] = refresh_token or google.get("refresh_token")
+    google["oauth_refresh_token"] = refresh_token or google.get("oauth_refresh_token")
+    google["token_expires_at"] = expiry_iso
+    google["client_id"] = client_id
+    google["client_secret"] = client_secret
+    google["redirect_uri"] = redirect_uri
+    google["method"] = "oauth"
+    google["calendar_id"] = google.get("calendar_id") or "primary"
+    integrations["google"] = google
+    user.integrations = integrations
+
+    db.commit()
+    return RedirectResponse(url=f"{settings.FRONTEND_URL}/integrations?google=connected")

@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan events"""
     auto_sync_task: Optional[asyncio.Task] = None
     retention_task: Optional[asyncio.Task] = None
+    auto_join_task: Optional[asyncio.Task] = None
 
     async def _auto_sync_loop():
         from app.api.v1.endpoints.integrations import run_integration_auto_sync_for_all_users
@@ -78,6 +79,53 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             except Exception as exc:
                 logger.error(f"Retention enforcement failed: {exc}", exc_info=True)
 
+    async def _auto_join_loop():
+        """
+        Every MEET_BOT_LEAD_TIME_MINUTES minutes, check all Google-connected users
+        for meetings starting soon and dispatch the Playwright bot automatically.
+        """
+        from app.services.meet_bot import auto_join_upcoming_meets
+        from app.api.v1.endpoints.integrations import _get_google_access_token
+        from app.core.database import SessionLocal
+        from sqlalchemy import select
+
+        interval_seconds = max(settings.MEET_BOT_LEAD_TIME_MINUTES, 1) * 60
+
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if not settings.MEET_BOT_AUTO_JOIN_ENABLED:
+                continue
+            try:
+                with SessionLocal() as db:
+                    from app.models.user import User as UserModel
+                    users = db.execute(
+                        select(UserModel).where(UserModel.google_connected.is_(True))
+                    ).scalars().all()
+
+                for user in users:
+                    try:
+                        with SessionLocal() as db:
+                            db_user = db.get(UserModel, user.id)
+                            if not db_user:
+                                continue
+                            access_token = await _get_google_access_token(db=db, current_user=db_user)
+
+                        result = await auto_join_upcoming_meets(
+                            user_id=str(user.id),
+                            organization_id=str(user.organization_id),
+                            access_token=access_token,
+                            lead_time_minutes=settings.MEET_BOT_LEAD_TIME_MINUTES,
+                            stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
+                            bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
+                            recordings_dir=settings.RECORDINGS_DIR,
+                        )
+                        if result.get("triggered", 0):
+                            logger.info(f"[AutoJoin] user={user.id} triggered={result['triggered']} meetings={result.get('meetings')}")
+                    except Exception as user_exc:
+                        logger.debug(f"[AutoJoin] skipped user={user.id}: {user_exc}")
+            except Exception as exc:
+                logger.error(f"[AutoJoin] scheduler loop error: {exc}", exc_info=True)
+
     # Startup
     logger.info("Starting Meeting Intelligence Agent...")
     init_db()
@@ -100,6 +148,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             "Retention enforcement scheduler enabled "
             f"(interval={settings.RETENTION_ENFORCEMENT_INTERVAL_MINUTES} minutes)"
         )
+
+    if settings.MEET_BOT_AUTO_JOIN_ENABLED:
+        auto_join_task = asyncio.create_task(_auto_join_loop())
+        logger.info(
+            f"[AutoJoin] scheduler enabled "
+            f"(check every {settings.MEET_BOT_LEAD_TIME_MINUTES} minutes, "
+            f"stay {settings.MEET_BOT_STAY_DURATION_SECONDS}s)"
+        )
+
+    # Debug: confirm Google OAuth is configured
+    _gid = (settings.GOOGLE_CLIENT_ID or "").strip()
+    _gsec = (settings.GOOGLE_CLIENT_SECRET or "").strip()
+    _masked_id = (_gid[:8] + "..." + _gid[-8:]) if len(_gid) >= 16 else (_gid or "MISSING")
+    _masked_sec = (_gsec[:4] + "****" + _gsec[-4:]) if len(_gsec) >= 8 else ("MISSING" if not _gsec else "****")
+    logger.info(
+        f"[Google OAuth] client_id={_masked_id} (len={len(_gid)}) | "
+        f"client_secret={_masked_sec} (len={len(_gsec)}) | "
+        f"redirect_uri={settings.GOOGLE_REDIRECT_URI}"
+    )
+    if not _gsec:
+        logger.warning("[Google OAuth] GOOGLE_CLIENT_SECRET is not set — /auth/google/callback will fail")
 
     logger.info("Application started successfully")
     
@@ -124,6 +193,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         retention_task.cancel()
         try:
             await retention_task
+        except asyncio.CancelledError:
+            pass
+
+    if auto_join_task:
+        auto_join_task.cancel()
+        try:
+            await auto_join_task
         except asyncio.CancelledError:
             pass
 

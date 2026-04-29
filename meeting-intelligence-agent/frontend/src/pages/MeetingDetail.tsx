@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { useQuery } from 'react-query'
 import { Link, useParams } from 'react-router-dom'
-import { AlertCircle, Clock3, MessageSquareQuote, UploadCloud } from 'lucide-react'
+import { AlertCircle, Clock3, FileText, MessageSquareQuote, Mic, UploadCloud } from 'lucide-react'
 
 import { api } from '../lib/api'
 import { Badge } from '@/components/ui/badge'
@@ -56,6 +56,23 @@ const MeetingDetail: React.FC = () => {
     async () => {
       const response = await api.get(`/api/v1/meetings/${id}/pre-brief`)
       return response.data
+    },
+    { enabled: Boolean(id) },
+  )
+
+  const { data: transcriptSegments } = useQuery(
+    ['meeting-transcript', id],
+    async () => {
+      const response = await api.get(`/api/v1/transcripts/?meeting_id=${id}`)
+      return response.data as Array<{
+        id: string
+        segment_number: number
+        speaker_id: string | null
+        text: string
+        start_time: number | null
+        end_time: number | null
+        confidence: number | null
+      }>
     },
     { enabled: Boolean(id) },
   )
@@ -225,6 +242,29 @@ const MeetingDetail: React.FC = () => {
         </CardContent>
       </Card>
 
+      {meeting.has_recording && (
+        <Card className="border-slate-200/60 shadow-sm">
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <Mic className="h-5 w-5 text-green-600" />
+              <div>
+                <CardTitle className="text-lg font-semibold text-gray-900">Recording</CardTitle>
+                <CardDescription>Listen to the meeting audio.</CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <audio
+              controls
+              className="w-full"
+              src={`/api/v1/meetings/${id}/recording`}
+            >
+              Your browser does not support the audio element.
+            </audio>
+          </CardContent>
+        </Card>
+      )}
+
       <Card className="border-slate-200/60 shadow-sm">
         <CardHeader>
           <div className="flex items-center gap-3">
@@ -237,6 +277,55 @@ const MeetingDetail: React.FC = () => {
         </CardHeader>
         <CardContent>
           <p className="text-gray-700 whitespace-pre-wrap">{meeting.summary || 'Summary will appear after processing.'}</p>
+        </CardContent>
+      </Card>
+
+      <Card className="border-slate-200/60 shadow-sm">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <div className="flex items-center gap-3">
+            <FileText className="h-5 w-5 text-green-600" />
+            <div>
+              <CardTitle className="text-lg font-semibold text-gray-900">Transcript</CardTitle>
+              <CardDescription>Full text of what was said in the meeting.</CardDescription>
+            </div>
+          </div>
+          {transcriptSegments && transcriptSegments.length > 0 && (
+            <span className="text-sm text-gray-500">{transcriptSegments.length} segment{transcriptSegments.length === 1 ? '' : 's'}</span>
+          )}
+        </CardHeader>
+        <CardContent>
+          {!transcriptSegments || transcriptSegments.length === 0 ? (
+            <p className="text-sm text-gray-500">
+              {meeting.transcription_status === 'completed'
+                ? 'No transcript segments saved for this meeting.'
+                : meeting.transcription_status === 'processing'
+                ? 'Transcription in progress…'
+                : 'Transcript will appear here after the meeting is processed.'}
+            </p>
+          ) : (
+            <div className="space-y-0 divide-y divide-gray-100 max-h-[500px] overflow-y-auto rounded-lg border border-gray-100">
+              {transcriptSegments.map((seg) => {
+                const formatTime = (s: number | null) => {
+                  if (s == null) return ''
+                  const m = Math.floor(s / 60)
+                  const sec = Math.floor(s % 60)
+                  return `${m}:${String(sec).padStart(2, '0')}`
+                }
+                const speaker = seg.speaker_id || 'Speaker'
+                return (
+                  <div key={seg.id} className="flex gap-4 px-4 py-3 hover:bg-slate-50">
+                    <div className="w-20 shrink-0 text-right">
+                      <span className="text-xs text-gray-400 font-mono">{formatTime(seg.start_time)}</span>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <span className="text-xs font-semibold text-primary-600 uppercase tracking-wide mr-2">{speaker}</span>
+                      <span className="text-sm text-gray-800">{seg.text}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </CardContent>
       </Card>
 

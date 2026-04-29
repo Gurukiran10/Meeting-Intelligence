@@ -53,6 +53,9 @@ nltk>=3.8.1
 pinecone-client>=3.0.2
 chromadb>=0.4.22
 
+# Meet Bot (browser automation)
+playwright>=1.44.0
+
 # Integrations - Calendar
 google-auth>=2.27.0
 google-auth-oauthlib>=1.2.0

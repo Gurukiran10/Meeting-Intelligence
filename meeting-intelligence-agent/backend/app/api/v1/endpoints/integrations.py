@@ -5,12 +5,16 @@ This module still owns the route handlers, but request schemas now live in
 `integrations_schemas.py` so the handler file is easier to navigate and safer
 to refactor incrementally.
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from datetime import datetime, timedelta, timezone
+import asyncio
+import traceback
 import httpx
 import base64
 import os
@@ -18,6 +22,8 @@ import re
 import json
 import uuid
 from urllib.parse import urlencode
+
+logger = logging.getLogger(__name__)
 
 from app.core.database import get_db
 from app.core.database import SessionLocal
@@ -929,11 +935,20 @@ def _get_google_oauth_client_credentials(
 
 async def _get_google_access_token(db: Session, current_user: User) -> str:
     google = _get_integration(current_user, "google")
-    access_token = google.get("access_token")
-    refresh_token = google.get("refresh_token") or google.get("oauth_refresh_token")
+
+    # Prefer JSON field; fall back to dedicated DB columns written by auth callback
+    access_token = google.get("access_token") or current_user.google_access_token
+    refresh_token = (
+        google.get("refresh_token")
+        or google.get("oauth_refresh_token")
+        or current_user.google_refresh_token
+    )
 
     expires_at_raw = google.get("token_expires_at")
     expires_at = _parse_iso_datetime(expires_at_raw) if isinstance(expires_at_raw, str) else None
+    if expires_at is None and current_user.google_token_expiry:
+        expires_at = current_user.google_token_expiry
+
     if access_token and expires_at and expires_at > datetime.utcnow() + timedelta(seconds=60):
         return access_token
 
@@ -1095,7 +1110,7 @@ async def list_integrations(
     google = _get_integration(current_user, "google")
     microsoft = _get_integration(current_user, "microsoft")
 
-    google_connected = bool(
+    google_connected = bool(current_user.google_connected) or bool(
         google.get("api_key")
         or google.get("service_account_json")
         or google.get("refresh_token")
@@ -1135,8 +1150,8 @@ async def list_integrations(
             "description": "Connect Google OAuth, sync Google Meet events from Calendar, and enable automated capture workflows.",
             "connected": google_connected,
             "config": {
-                "calendar_id": google.get("calendar_id"),
-                "method": google.get("method") or ("oauth" if google.get("refresh_token") else None),
+                "email": current_user.google_email or google.get("calendar_id"),
+                "method": "oauth",
             }
             if google_connected
             else None,
@@ -1849,7 +1864,47 @@ async def disconnect_google(
     current_user: User = Depends(get_current_user),
 ):
     _remove_integration(db, current_user, "google")
+    # Also clear dedicated DB columns written by the OAuth callback
+    current_user.google_access_token = None
+    current_user.google_refresh_token = None
+    current_user.google_token_expiry = None
+    current_user.google_email = None
+    current_user.google_connected = False
+    db.commit()
     return {"status": "disconnected"}
+
+
+@router.get("/google/test-oauth")
+async def test_google_oauth(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dedicated OAuth test — skips api_key/service_account branches entirely."""
+    if not current_user.google_connected and not current_user.google_refresh_token:
+        raise HTTPException(status_code=400, detail="Google OAuth is not connected")
+
+    access_token = await _get_google_access_token(db=db, current_user=current_user)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"maxResults": 1},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Google Calendar API error: {resp.text}")
+
+    items = resp.json().get("items", [])
+    calendar_name = items[0].get("summary", "primary") if items else "primary"
+
+    return {
+        "status": "ok",
+        "method": "oauth",
+        "email": current_user.google_email,
+        "calendar": calendar_name,
+        "summary": f"Connected as {current_user.google_email or 'unknown'} — {calendar_name}",
+    }
 
 
 @router.post("/google/test")
@@ -1861,7 +1916,11 @@ async def test_google(
     api_key = google.get("api_key")
     calendar_id = google.get("calendar_id") or "primary"
     service_account_json = google.get("service_account_json")
-    oauth_refresh_token = google.get("refresh_token")
+    oauth_refresh_token = (
+        google.get("refresh_token")
+        or google.get("oauth_refresh_token")
+        or current_user.google_refresh_token
+    )
 
     if not api_key and not service_account_json and not oauth_refresh_token:
         raise HTTPException(status_code=400, detail="Google is not connected")
@@ -2057,6 +2116,147 @@ async def list_upcoming_google_meet_events(
     return {"events": events, "count": len(events), "calendar_id": resolved_calendar_id}
 
 
+# ─── Meet Bot: join / status / stop ──────────────────────────────────────────
+# Module-level set keeps Task objects alive so GC doesn't kill them.
+_bot_tasks: set = set()
+
+
+class MeetJoinRequest(BaseModel):
+    meet_url: str
+    meeting_id: Optional[str] = None             # link to existing Meeting record
+    stay_duration_seconds: Optional[int] = None  # overrides MEET_BOT_STAY_DURATION_SECONDS
+    bot_display_name: Optional[str] = None       # overrides MEET_BOT_DISPLAY_NAME
+
+
+@router.post("/google/meet/join")
+async def join_google_meet_endpoint(
+    body: MeetJoinRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Dispatch a Playwright bot to join a Google Meet.
+    The bot:
+      • upserts a Meeting record in the DB
+      • records system audio via ffmpeg or Playwright MediaRecorder
+      • calls process_meeting_recording_background() after leaving
+    Returns immediately — all work is non-blocking.
+    """
+    from app.services.meet_bot import join_google_meet, is_valid_meet_url
+
+    # ── Entrypoint diagnostics ────────────────────────────────────────────────
+    print(f"[BOT] JOIN API HIT — user={current_user.id} raw_url={body.meet_url!r}", flush=True)
+    logger.info("[BOT] JOIN API HIT — user=%s raw_url=%r", current_user.id, body.meet_url)
+
+    meet_url = (body.meet_url or "").strip()
+    if not is_valid_meet_url(meet_url):
+        print(f"[BOT] REJECTED invalid URL: {meet_url!r}", flush=True)
+        logger.warning("[BOT] REJECTED invalid Meet URL: %r", meet_url)
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid Google Meet URL '{meet_url}'. Expected: https://meet.google.com/xxx-xxxx-xxx",
+        )
+
+    print(f"[BOT] URL validated OK — dispatching bot for {meet_url!r}", flush=True)
+    logger.info("[BOT] URL validated OK — dispatching bot for %r", meet_url)
+
+    stay = body.stay_duration_seconds or settings.MEET_BOT_STAY_DURATION_SECONDS
+    name = (body.bot_display_name or settings.MEET_BOT_DISPLAY_NAME).strip()
+    user_id = str(current_user.id)
+    org_id = str(current_user.organization_id)
+
+    async def _safe_join() -> None:
+        try:
+            print(f"[BOT] _safe_join: calling join_google_meet()", flush=True)
+            await join_google_meet(
+                meet_url=meet_url,
+                user_id=user_id,
+                organization_id=org_id,
+                meeting_id=body.meeting_id or None,
+                bot_display_name=name,
+                stay_duration_seconds=stay,
+                recordings_dir=settings.RECORDINGS_DIR,
+            )
+            print(f"[BOT] _safe_join: join_google_meet() returned", flush=True)
+        except Exception as exc:
+            print(f"[BOT ERROR] _safe_join unhandled exception: {exc}", flush=True)
+            traceback.print_exc()
+
+    task = asyncio.create_task(_safe_join(), name=f"meet_bot_endpoint:{user_id}")
+    _bot_tasks.add(task)
+    task.add_done_callback(_bot_tasks.discard)
+
+    return {
+        "status": "joining_started",
+        "meet_url": meet_url,
+        "bot_name": name,
+        "stay_duration_seconds": stay,
+        "user_id": user_id,
+        "org_id": org_id,
+    }
+
+
+@router.get("/google/meet/join/status")
+async def get_meet_bot_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the current bot session status for this user."""
+    from app.services.meet_bot import get_bot_status
+
+    session = get_bot_status(str(current_user.id))
+    if not session:
+        return {"status": "idle", "meet_url": None}
+    return session
+
+
+@router.delete("/google/meet/join")
+async def stop_meet_bot(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel the running bot session for this user (if any)."""
+    from app.services.meet_bot import stop_bot
+
+    stopped = await stop_bot(str(current_user.id))
+    return {"stopped": stopped}
+
+
+# ── Meet auto-join: trigger immediately for meetings starting soon ─────────────
+
+@router.post("/google/meet/auto-join/run-now")
+async def trigger_meet_auto_join(
+    calendar_id: str = "primary",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Immediately check upcoming Google Calendar events and trigger the bot
+    for any meeting starting within MEET_BOT_LEAD_TIME_MINUTES.
+    """
+    from app.services.meet_bot import auto_join_upcoming_meets
+
+    if not settings.MEET_BOT_AUTO_JOIN_ENABLED:
+        return {"status": "disabled", "message": "MEET_BOT_AUTO_JOIN_ENABLED is False"}
+
+    try:
+        access_token = await _get_google_access_token(db=db, current_user=current_user)
+    except HTTPException:
+        raise HTTPException(status_code=400, detail="Google OAuth not connected")
+
+    result = await auto_join_upcoming_meets(
+        user_id=str(current_user.id),
+        organization_id=str(current_user.organization_id),
+        access_token=access_token,
+        calendar_id=calendar_id or "primary",
+        lead_time_minutes=settings.MEET_BOT_LEAD_TIME_MINUTES,
+        stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
+        bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
+        recordings_dir=settings.RECORDINGS_DIR,
+    )
+    return {"status": "ok", **result}
+
+
 @router.post("/google/sync")
 async def sync_google_meetings(
     days_ahead: int = 30,
@@ -2068,7 +2268,11 @@ async def sync_google_meetings(
     google = _get_integration(current_user, "google")
     api_key = google.get("api_key")
     calendar_id = google.get("calendar_id") or "primary"
-    oauth_refresh_token = google.get("refresh_token")
+    oauth_refresh_token = (
+        google.get("refresh_token")
+        or google.get("oauth_refresh_token")
+        or current_user.google_refresh_token
+    )
 
     if not api_key and not oauth_refresh_token:
         raise HTTPException(

@@ -29,6 +29,58 @@ from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
+# ── Whisper silence hallucinations ───────────────────────────────────────────
+# Whisper emits these phrases when it receives silence instead of speech.
+_WHISPER_HALLUCINATIONS: set[str] = {
+    "thank you.", "thank you!", "thank you",
+    "grazie.", "grazie",
+    "you.", "you",
+    "bye.", "bye",
+    "goodbye.", "goodbye",
+    "ok.", "ok", "okay.", "okay",
+    "thanks.", "thanks",
+    ".", "..", "...",
+    "",
+}
+
+
+def _filter_hallucinations(segments):
+    """Remove Whisper silence hallucination segments."""
+    cleaned = []
+    for seg in segments:
+        normalized = seg.text.strip().lower().rstrip(".")
+        if normalized in {h.rstrip(".") for h in _WHISPER_HALLUCINATIONS}:
+            logger.debug(f"Dropping hallucination segment: {repr(seg.text)} @ {seg.start:.1f}s")
+            continue
+        # Single-word segments under 4 chars are almost always noise
+        words = seg.text.strip().split()
+        if len(words) == 1 and len(seg.text.strip()) <= 4:
+            logger.debug(f"Dropping short noise segment: {repr(seg.text)} @ {seg.start:.1f}s")
+            continue
+        cleaned.append(seg)
+    dropped = len(segments) - len(cleaned)
+    if dropped:
+        logger.info(f"Hallucination filter: removed {dropped}/{len(segments)} noise segments")
+    return cleaned
+
+
+def _assign_speakers(segments):
+    """
+    Assign speaker labels using silence-gap heuristic.
+    A gap > 1.5s between consecutive segments suggests a speaker change.
+    Works best for 2-person calls; produces Speaker 1 / Speaker 2 labels.
+    """
+    if not segments:
+        return
+    GAP_THRESHOLD = 1.5  # seconds
+    current_speaker = 1
+    prev_end = 0.0
+    for i, seg in enumerate(segments):
+        if i > 0 and (seg.start - prev_end) >= GAP_THRESHOLD:
+            current_speaker = 2 if current_speaker == 1 else 1
+        seg.speaker = f"Speaker {current_speaker}"
+        prev_end = seg.end
+
 
 def _match_user_by_name(users: List[User], owner_name: Optional[str]) -> Optional[User]:
     if not owner_name:
@@ -150,6 +202,12 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
             )
             if not transcription.segments:
                 raise RuntimeError("Transcript is empty")
+
+            # Filter Whisper silence hallucinations, then assign speaker labels
+            transcription.segments = _filter_hallucinations(transcription.segments)
+            if not transcription.segments:
+                raise RuntimeError("Transcript is empty after hallucination filtering")
+            _assign_speakers(transcription.segments)
 
             # Save transcripts
             for idx, segment in enumerate(transcription.segments):

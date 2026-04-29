@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { useQuery } from 'react-query'
-import { Plus, Search, Trash2, X } from 'lucide-react'
+import { MessageSquareQuote, Plus, Search, Trash2, Users, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../lib/api'
 
@@ -10,6 +10,9 @@ type Meeting = {
   description?: string | null
   platform: string
   status: string
+  transcription_status?: string
+  analysis_status?: string
+  summary?: string | null
   scheduled_start: string
   attendee_count?: number
   attendee_ids?: string[]
@@ -73,6 +76,22 @@ const Meetings: React.FC = () => {
     retry: 1,
     refetchOnWindowFocus: false,
   })
+
+  const { data: allMentions } = useQuery<{ meeting_id: string }[]>('all-mentions', async () => {
+    const response = await api.get('/api/v1/mentions/', { timeout: 15000 })
+    return response.data
+  }, {
+    retry: 1,
+    refetchOnWindowFocus: false,
+  })
+
+  const mentionCountByMeeting = useMemo(() => {
+    const counts: Record<string, number> = {}
+    for (const m of allMentions || []) {
+      if (m.meeting_id) counts[m.meeting_id] = (counts[m.meeting_id] || 0) + 1
+    }
+    return counts
+  }, [allMentions])
 
   const attendeeSuggestions = useMemo(() => {
     const q = attendeeQuery.trim().toLowerCase()
@@ -415,23 +434,45 @@ const Meetings: React.FC = () => {
                 className="p-6 hover:bg-gray-50 transition-colors"
               >
                 <div className="flex items-start justify-between">
-                  <div className="flex-1">
+                  <div className="flex-1 min-w-0">
                     <Link to={`/meetings/${meeting.id}`} className="text-lg font-medium text-gray-900 hover:text-primary-700">
                       {meeting.title}
                     </Link>
-                    <p className="mt-1 text-sm text-gray-500">{meeting.description}</p>
+                    {!meeting.summary && meeting.description && (
+                      <p className="mt-1 text-sm text-gray-500">{meeting.description}</p>
+                    )}
                     <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-gray-500">
                       <span>{new Date(meeting.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })}</span>
                       <span>{meeting.platform}</span>
-                      <span>{meeting.attendee_count ?? meeting.attendee_ids?.length ?? 0} attendees</span>
-                      <span className={`px-2 py-1 rounded-full text-xs ${
+                      <span className="flex items-center gap-1">
+                        <Users className="w-3.5 h-3.5" />
+                        {meeting.attendee_count ?? meeting.attendee_ids?.length ?? 0}
+                      </span>
+                      <span className={`px-2 py-1 rounded-full text-xs font-medium ${
                         meeting.status === 'completed' ? 'bg-green-100 text-green-700' :
                         meeting.status === 'in_progress' ? 'bg-blue-100 text-blue-700' :
+                        meeting.status === 'failed' ? 'bg-red-100 text-red-700' :
                         'bg-gray-100 text-gray-700'
                       }`}>
                         {meeting.status}
                       </span>
+                      {(mentionCountByMeeting[meeting.id] ?? 0) > 0 && (
+                        <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-blue-50 text-blue-600 text-xs font-medium">
+                          <MessageSquareQuote className="w-3 h-3" />
+                          {mentionCountByMeeting[meeting.id]} mention{mentionCountByMeeting[meeting.id] === 1 ? '' : 's'}
+                        </span>
+                      )}
                     </div>
+
+                    {meeting.status === 'completed' && meeting.summary && (
+                      <div className="mt-3 rounded-lg bg-slate-50 border border-slate-100 px-4 py-3">
+                        <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Summary</p>
+                        <p className="text-sm text-gray-700 leading-relaxed">
+                          {meeting.summary.length > 200 ? `${meeting.summary.slice(0, 200)}…` : meeting.summary}
+                        </p>
+                      </div>
+                    )}
+
                     {Array.isArray(meeting.tags) && meeting.tags.length > 0 && (
                       <div className="mt-3 flex flex-wrap gap-2">
                         {meeting.tags.map((tag) => (
@@ -444,7 +485,7 @@ const Meetings: React.FC = () => {
                   </div>
                   <button
                     onClick={() => handleDelete(meeting.id)}
-                    className="ml-4 text-gray-400 hover:text-red-600"
+                    className="ml-4 text-gray-400 hover:text-red-600 shrink-0"
                     title="Delete meeting"
                   >
                     <Trash2 className="w-5 h-5" />

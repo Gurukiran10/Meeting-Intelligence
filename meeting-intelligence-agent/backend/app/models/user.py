@@ -47,6 +47,13 @@ class User(Base):
         "alert_channels": ["slack", "email"], # Channels for alerts
     })
     
+    # Google OAuth
+    google_access_token = Column(String(2048), nullable=True)
+    google_refresh_token = Column(String(512), nullable=True)
+    google_token_expiry = Column(DateTime, nullable=True)
+    google_email = Column(String(255), nullable=True)
+    google_connected = Column(Boolean, default=False)
+
     # Integrations
     integrations = Column(JSON, default={})
     

@@ -4,7 +4,10 @@ Meetings API Endpoints
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
+import mimetypes
+import os
+from fastapi import APIRouter, Depends, HTTPException, Request, status, UploadFile, File, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, cast, String, or_
 from pydantic import BaseModel, Field, field_validator, ConfigDict
@@ -214,6 +217,7 @@ class MeetingDetail(MeetingResponse):
     meeting_quality_score: Optional[float]
     action_items: List[InlineActionItemResponse] = []
     mentions: List[InlineMentionResponse] = []
+    has_recording: bool = False
 
 
 class PreBriefMeetingContext(BaseModel):
@@ -386,8 +390,81 @@ async def get_meeting(
     }
     meeting_dict["action_items"] = meeting_action_items
     meeting_dict["mentions"] = meeting_mentions
+    recording_path = meeting_dict.get("recording_path") or ""
+    meeting_dict["has_recording"] = bool(recording_path and os.path.exists(recording_path))
 
     return MeetingDetail.model_validate(meeting_dict)
+
+
+@router.get("/{meeting_id}/recording")
+async def stream_recording(
+    meeting_id: UUID,
+    request: Request,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Stream the meeting recording audio file with HTTP range support."""
+    result = db.execute(select(Meeting).where(Meeting.id == meeting_id))
+    meeting = result.scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    path = (meeting.recording_path or "").strip()
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording not found")
+
+    file_size = os.path.getsize(path)
+    mime_type = mimetypes.guess_type(path)[0] or "audio/webm"
+
+    range_header = request.headers.get("range")
+    if range_header:
+        # Parse "bytes=start-end"
+        range_match = range_header.strip().replace("bytes=", "").split("-")
+        start = int(range_match[0]) if range_match[0] else 0
+        end = int(range_match[1]) if range_match[1] else file_size - 1
+        end = min(end, file_size - 1)
+        chunk_size = end - start + 1
+
+        def _iter():
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = chunk_size
+                while remaining > 0:
+                    data = f.read(min(65536, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            _iter(),
+            status_code=206,
+            media_type=mime_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(chunk_size),
+            },
+        )
+
+    def _iter_full():
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(65536)
+                if not data:
+                    break
+                yield data
+
+    return StreamingResponse(
+        _iter_full(),
+        media_type=mime_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+        },
+    )
 
 
 @router.post("/{meeting_id}/upload", response_model=MeetingResponse)

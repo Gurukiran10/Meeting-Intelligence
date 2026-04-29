@@ -129,6 +129,14 @@ class Settings(BaseSettings):
     RECORDING_RETENTION_DAYS: int = 90
     AUTO_DELETE_RECORDINGS: bool = True
     
+    # Meet Bot
+    MEET_BOT_STAY_DURATION_SECONDS: int = 600    # how long bot stays in meeting
+    MEET_BOT_LEAD_TIME_MINUTES: int = 2          # join this many minutes before start
+    MEET_BOT_DISPLAY_NAME: str = "SyncMinds Bot" # name shown in meeting
+    MEET_BOT_HEADLESS: bool = False              # always False for Google Meet
+    MEET_BOT_AUTO_JOIN_ENABLED: bool = True      # global switch for scheduler
+    RECORDINGS_DIR: str = "recordings"          # local dir for audio files
+
     # Features
     ENABLE_REAL_TIME_ALERTS: bool = True
     ENABLE_PRE_MEETING_BRIEFS: bool = True

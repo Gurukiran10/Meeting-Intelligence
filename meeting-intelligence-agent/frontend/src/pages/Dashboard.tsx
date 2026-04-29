@@ -1,17 +1,21 @@
-import React from 'react'
-import { useQuery } from 'react-query'
+import React, { useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { 
-  Calendar, 
-  Clock, 
-  TrendingUp, 
-  CheckCircle, 
-  AlertCircle, 
+import {
+  Calendar,
+  Clock,
+  TrendingUp,
+  CheckCircle,
+  AlertCircle,
   ChevronRight,
   Plus,
   Video,
   FileText,
-  Users
+  Users,
+  Play,
+  Square,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { getAccessToken } from '../lib/auth'
@@ -20,9 +24,25 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 
+// ── toast helper (inline, no dependency) ──────────────────────────────────────
+function showToast(msg: string, type: 'info' | 'error' = 'info') {
+  const el = document.createElement('div')
+  el.textContent = msg
+  el.style.cssText = `
+    position:fixed;bottom:24px;right:24px;z-index:9999;padding:12px 20px;
+    border-radius:10px;font-size:14px;font-weight:600;color:#fff;
+    background:${type === 'error' ? '#ef4444' : '#2563eb'};
+    box-shadow:0 4px 20px rgba(0,0,0,.18);animation:fadein .2s;
+  `
+  document.body.appendChild(el)
+  setTimeout(() => el.remove(), 4000)
+}
+
 const Dashboard: React.FC = () => {
   const navigate = useNavigate()
   const hasToken = Boolean(getAccessToken())
+  const qc = useQueryClient()
+  const [joiningUrl, setJoiningUrl] = useState<string | null>(null)
   
   const { data: currentUser } = useQuery('dashboard-current-user', async () => {
     const response = await api.get('/api/v1/auth/me')
@@ -53,6 +73,85 @@ const Dashboard: React.FC = () => {
     const response = await api.get('/api/v1/analytics/dashboard')
     return response.data
   })
+
+  // Upcoming Google Meet events (requires Google OAuth connected)
+  const {
+    data: upcomingMeetData,
+    isLoading: meetLoading,
+    refetch: refetchMeets,
+  } = useQuery(
+    'upcoming-google-meets',
+    async () => {
+      const res = await api.get('/api/v1/integrations/google/meet/upcoming?days_ahead=7')
+      return res.data
+    },
+    {
+      enabled: hasToken,
+      retry: false,
+      staleTime: 60_000,
+    }
+  )
+
+  // Bot status polling — auto-refetch every 5s when a bot is active
+  const { data: botStatus } = useQuery(
+    'meet-bot-status',
+    async () => {
+      const res = await api.get('/api/v1/integrations/google/meet/join/status')
+      return res.data
+    },
+    {
+      enabled: hasToken,
+      refetchInterval: joiningUrl ? 5000 : false,
+      retry: false,
+    }
+  )
+
+  const joinMeetMutation = useMutation(
+    async (meetUrl: string) => {
+      console.log('[BOT] API call starting — POST /api/v1/integrations/google/meet/join', { meet_url: meetUrl })
+      const res = await api.post('/api/v1/integrations/google/meet/join', {
+        meet_url: meetUrl,
+        stay_duration_seconds: 600,
+      })
+      console.log('[BOT] API response', res.status, res.data)
+      return res.data
+    },
+    {
+      onMutate: (meetUrl) => {
+        console.log('[BOT] mutation started for', meetUrl)
+        setJoiningUrl(meetUrl)
+      },
+      onSuccess: (data) => {
+        console.log('[BOT] mutation success', data)
+        showToast('Opened meeting tab · Bot is joining too…')
+        qc.invalidateQueries('meet-bot-status')
+      },
+      onError: (err: any) => {
+        const detail = err?.response?.data?.detail || err?.message || 'Failed to start bot'
+        console.error('[BOT] mutation error', err?.response?.status, detail, err)
+        showToast(detail, 'error')
+        setJoiningUrl(null)
+      },
+    }
+  )
+
+  const stopBotMutation = useMutation(
+    async () => {
+      const res = await api.delete('/api/v1/integrations/google/meet/join')
+      return res.data
+    },
+    {
+      onSuccess: () => {
+        showToast('Bot stopped.')
+        setJoiningUrl(null)
+        qc.invalidateQueries('meet-bot-status')
+      },
+    }
+  )
+
+  const upcomingMeetEvents: any[] = upcomingMeetData?.events || []
+  const activeBotStatus: string | undefined = botStatus?.status
+  const botIsActive = activeBotStatus && !['idle', 'completed', 'failed', 'cancelled'].includes(activeBotStatus)
 
   const stats = [
     {
@@ -299,6 +398,164 @@ const Dashboard: React.FC = () => {
                 <Users className="w-6 h-6 text-slate-300" />
               </div>
               <p className="text-sm text-slate-400 font-medium">No recent mentions for you.</p>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Upcoming Google Meet Events with Join Bot */}
+      <Card className="border-slate-200/60 shadow-sm">
+        <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
+          <div className="space-y-1">
+            <CardTitle className="text-xl font-bold flex items-center gap-2">
+              <Video className="w-5 h-5 text-blue-500" />
+              Upcoming Google Meets
+            </CardTitle>
+            <CardDescription>
+              Click "Join" to send a silent bot into the meeting that captures audio and context.
+            </CardDescription>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-slate-500 hover:text-blue-600"
+            onClick={() => refetchMeets()}
+          >
+            <RefreshCw className="w-4 h-4 mr-1" />
+            Refresh
+          </Button>
+        </CardHeader>
+        <CardContent className="pt-4">
+          {/* Bot status banner */}
+          {activeBotStatus && activeBotStatus !== 'idle' && (
+            <div
+              className={cn(
+                'mb-4 flex items-center justify-between rounded-xl border px-4 py-3 text-sm font-semibold',
+                botIsActive
+                  ? 'border-blue-200 bg-blue-50 text-blue-800'
+                  : activeBotStatus === 'completed'
+                  ? 'border-green-200 bg-green-50 text-green-800'
+                  : 'border-red-200 bg-red-50 text-red-800',
+              )}
+            >
+              <span className="flex items-center gap-2">
+                {botIsActive && <Loader2 className="w-4 h-4 animate-spin" />}
+                Bot status: <span className="capitalize">{activeBotStatus?.replace(/_/g, ' ')}</span>
+                {botStatus?.meet_url && (
+                  <span className="font-normal text-xs opacity-70 truncate max-w-[220px]">
+                    — {botStatus.meet_url}
+                  </span>
+                )}
+              </span>
+              {botIsActive && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-red-300 text-red-600 hover:bg-red-50"
+                  onClick={() => stopBotMutation.mutate()}
+                  disabled={stopBotMutation.isLoading}
+                >
+                  <Square className="w-3 h-3 mr-1 fill-current" />
+                  Stop Bot
+                </Button>
+              )}
+            </div>
+          )}
+
+          {meetLoading ? (
+            <div className="py-10 flex justify-center">
+              <Loader2 className="w-6 h-6 animate-spin text-slate-300" />
+            </div>
+          ) : upcomingMeetEvents.length === 0 ? (
+            <div className="py-12 text-center">
+              <div className="bg-slate-50 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4">
+                <Video className="w-6 h-6 text-slate-300" />
+              </div>
+              <p className="text-sm text-slate-400 font-medium">
+                {upcomingMeetData === undefined
+                  ? 'Connect Google Calendar to see upcoming meetings.'
+                  : 'No Google Meet events in the next 7 days.'}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {upcomingMeetEvents.slice(0, 6).map((event: any, idx: number) => {
+                const meetUrl: string = event._meet_url || event.hangoutLink || ''
+                const title: string = event.summary || 'Untitled Meeting'
+                const startRaw: string = event.start?.dateTime || event.start?.date || ''
+                const startDate = startRaw ? new Date(startRaw) : null
+                const isJoiningThis = joiningUrl === meetUrl && joinMeetMutation.isLoading
+                const isThisBotActive = botIsActive && botStatus?.meet_url === meetUrl
+
+                return (
+                  <div
+                    key={event.id || idx}
+                    className="flex items-center justify-between rounded-xl border border-slate-100 px-4 py-3 hover:bg-slate-50/50 transition-all"
+                  >
+                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                      <div className="bg-blue-50 p-2 rounded-lg flex-shrink-0">
+                        <Video className="w-4 h-4 text-blue-500" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-slate-900 truncate">{title}</p>
+                        {startDate && (
+                          <p className="text-xs text-slate-500 mt-0.5 font-medium flex items-center gap-1">
+                            <Clock className="w-3 h-3" />
+                            {startDate.toLocaleDateString()} at{' '}
+                            {startDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      {meetUrl && (
+                        <a
+                          href={meetUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-blue-500 hover:text-blue-700 font-semibold underline underline-offset-2"
+                        >
+                          Open
+                        </a>
+                      )}
+                      <Button
+                        size="sm"
+                        disabled={!meetUrl || isJoiningThis || isThisBotActive}
+                        className={cn(
+                          'text-xs font-bold h-8 px-3',
+                          isThisBotActive
+                            ? 'bg-green-600 hover:bg-green-700 cursor-default'
+                            : 'bg-blue-600 hover:bg-blue-700',
+                        )}
+                        onClick={() => {
+                          console.log('[BOT] Join clicked — meetUrl:', meetUrl, '| event:', event)
+                          if (!meetUrl) {
+                            console.warn('[BOT] meetUrl is empty — button should have been disabled')
+                            return
+                          }
+                          window.open(meetUrl, '_blank', 'noopener,noreferrer')
+                          joinMeetMutation.mutate(meetUrl)
+                        }}
+                      >
+                        {isJoiningThis ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : isThisBotActive ? (
+                          <>
+                            <CheckCircle className="w-3 h-3 mr-1" />
+                            Joined
+                          </>
+                        ) : (
+                          <>
+                            <Play className="w-3 h-3 mr-1 fill-current" />
+                            Join
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           )}
         </CardContent>

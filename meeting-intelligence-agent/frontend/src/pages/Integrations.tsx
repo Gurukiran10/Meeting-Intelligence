@@ -80,7 +80,6 @@ function ConnectModal({ integration, onClose, onConnected }: ConnectModalProps) 
   const [fields, setFields] = useState<Record<string, string>>({})
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const [googleOAuthLoading, setGoogleOAuthLoading] = useState(false)
 
   const set = (k: string, v: string) => setFields(f => ({ ...f, [k]: v }))
 
@@ -99,40 +98,23 @@ function ConnectModal({ integration, onClose, onConnected }: ConnectModalProps) 
   }
 
   const startGoogleOAuth = async () => {
+    const clientId = (fields.client_id || '').trim()
+
+    if (!clientId) {
+      setError('Client ID is required')
+      return
+    }
+
     setError('')
-    setGoogleOAuthLoading(true)
-
+    setLoading(true)
     try {
-      const calendarId = (fields.calendar_id || '').trim() || 'primary'
-      const clientId = (fields.client_id || '').trim() || undefined
-      const clientSecret = (fields.client_secret || '').trim() || undefined
-      const redirectUri = (fields.redirect_uri || '').trim() || undefined
-
-      sessionStorage.removeItem('mia_google_oauth_last_processed_code')
-
-      sessionStorage.setItem('mia_google_oauth_context', JSON.stringify({
-        calendar_id: calendarId,
-        client_id: clientId,
-        client_secret: clientSecret,
-        redirect_uri: redirectUri,
-        created_at: Date.now(),
-      }))
-
-      const params: Record<string, string> = { calendar_id: calendarId }
-      if (clientId) params.client_id = clientId
-      if (redirectUri) params.redirect_uri = redirectUri
-
-      const response = await api.get('/api/v1/integrations/google/oauth-url', { params })
-
-      const url = response.data?.url
-      if (!url) {
-        throw new Error('Missing Google OAuth URL from backend')
-      }
-
-      window.location.href = url
+      // Backend uses GOOGLE_REDIRECT_URI from its own env — we never send redirect_uri
+      const resp = await api.post('/api/v1/auth/google/login', { client_id: clientId })
+      const { auth_url } = resp.data
+      window.location.href = auth_url
     } catch (err: any) {
-      setError(err?.response?.data?.detail || err?.message || 'Failed to start Google OAuth flow')
-      setGoogleOAuthLoading(false)
+      setError(err?.response?.data?.detail || 'Failed to start Google OAuth')
+      setLoading(false)
     }
   }
 
@@ -215,45 +197,28 @@ function ConnectModal({ integration, onClose, onConnected }: ConnectModalProps) 
       case 'google':
         return (
           <>
-            <div className="p-3 bg-yellow-50 rounded-lg text-xs text-yellow-800 mb-2">
-              Option A: API key for public calendars. Option B: service account JSON for shared private calendars. Option C (recommended): Google OAuth one-click flow for real Google Meet access.
+            <div className="p-3 bg-blue-50 rounded-lg text-xs text-blue-800">
+              Create OAuth credentials at <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer" className="underline font-medium">Google Cloud Console</a>. Set the authorised redirect URI to <code className="bg-blue-100 px-1 rounded">http://localhost:3002/integrations</code>.
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">API Key</label>
-              <input type="password" placeholder="AIzaSy..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none" value={fields.api_key || ''} onChange={e => set('api_key', e.target.value)} />
+              <label className="block text-sm font-medium text-gray-700 mb-1">Client ID <span className="text-red-500">*</span></label>
+              <input
+                type="text"
+                placeholder="xxxxxxxx.apps.googleusercontent.com"
+                className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                value={fields.client_id || ''}
+                onChange={e => set('client_id', e.target.value)}
+              />
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Calendar ID</label>
-              <input type="text" placeholder="primary or your-email@gmail.com" className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none" value={fields.calendar_id || ''} onChange={e => set('calendar_id', e.target.value)} />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Service Account JSON (optional, for private calendars)</label>
-              <textarea rows={4} placeholder='{"type": "service_account", ...}' className="w-full border rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-indigo-500 focus:outline-none" value={fields.service_account_json || ''} onChange={e => set('service_account_json', e.target.value)} />
-            </div>
-            <div className="pt-1 border-t" />
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">OAuth Client ID (optional if set in backend env)</label>
-              <input type="text" placeholder="xxxxxxxx.apps.googleusercontent.com" className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none" value={fields.client_id || ''} onChange={e => set('client_id', e.target.value)} />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">OAuth Client Secret (optional if set in backend env)</label>
-              <input type="password" placeholder="GOCSPX-..." className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none" value={fields.client_secret || ''} onChange={e => set('client_secret', e.target.value)} />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">OAuth Redirect URI</label>
-              <input type="text" placeholder={`${window.location.origin}/integrations`} className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none" value={fields.redirect_uri || ''} onChange={e => set('redirect_uri', e.target.value)} />
-            </div>
-            <div>
-              <button
-                type="button"
-                onClick={startGoogleOAuth}
-                disabled={googleOAuthLoading}
-                className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-              >
-                {googleOAuthLoading ? 'Redirecting to Google...' : 'Continue with Google OAuth'}
-              </button>
-              <p className="text-xs text-gray-500 mt-1">Use this for real Google Meet integration without manual auth code copy/paste.</p>
-            </div>
+            <button
+              type="button"
+              onClick={startGoogleOAuth}
+              disabled={loading}
+              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 flex items-center justify-center gap-2"
+            >
+              {loading ? <span className="h-4 w-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <GoogleIcon />}
+              {loading ? 'Redirecting to Google...' : 'Connect with Google'}
+            </button>
           </>
         )
       case 'microsoft':
@@ -316,15 +281,17 @@ function ConnectModal({ integration, onClose, onConnected }: ConnectModalProps) 
             <button onClick={onClose} className="flex-1 px-4 py-2 border rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50">
               Cancel
             </button>
-            <button
-              onClick={handleSubmit}
-              disabled={loading}
-              className="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center gap-2"
-            >
-              {loading ? (
-                <><span className="h-4 w-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Connecting...</>
-              ) : 'Connect'}
-            </button>
+            {integration.id !== 'google' && (
+              <button
+                onClick={handleSubmit}
+                disabled={loading}
+                className="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {loading ? (
+                  <><span className="h-4 w-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Connecting...</>
+                ) : 'Connect'}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -368,7 +335,9 @@ function TestModal({ integration, onClose, onConfirm }: TestModalProps) {
       case 'zoom':
         return 'Verify OAuth credentials and fetch account info'
       case 'google':
-        return 'Verify API key and fetch calendar info'
+        return integration.config?.method === 'oauth'
+          ? 'Verify Google OAuth connection and fetch calendar list'
+          : 'Verify API key and fetch calendar info'
       case 'microsoft':
         return 'Verify credentials and fetch organization info'
       default:
@@ -447,6 +416,19 @@ function TestModal({ integration, onClose, onConfirm }: TestModalProps) {
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
+function showIntegrationToast(msg: string, isError = false) {
+  const el = document.createElement('div')
+  el.textContent = msg
+  el.style.cssText = `
+    position:fixed;bottom:24px;right:24px;z-index:9999;padding:12px 20px;
+    border-radius:10px;font-size:14px;font-weight:600;color:#fff;
+    background:${isError ? '#ef4444' : '#2563eb'};
+    box-shadow:0 4px 20px rgba(0,0,0,.18);
+  `
+  document.body.appendChild(el)
+  setTimeout(() => el.remove(), 4000)
+}
+
 export default function Integrations() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
@@ -474,45 +456,13 @@ export default function Integrations() {
   })
 
   useEffect(() => {
-    const code = searchParams.get('code')
-    if (!code) return
-
-    const lastProcessedCode = sessionStorage.getItem('mia_google_oauth_last_processed_code')
-    if (lastProcessedCode === code) {
+    const googleParam = searchParams.get('google')
+    if (googleParam === 'connected') {
+      setAutoSyncResult({ ok: true, msg: 'Google connected successfully' })
+      qc.invalidateQueries('integrations')
       navigate('/integrations', { replace: true })
-      return
+      setTimeout(() => setAutoSyncResult(null), 6000)
     }
-
-    sessionStorage.setItem('mia_google_oauth_last_processed_code', code)
-
-    const runGoogleOAuthCallback = async () => {
-      setAutoSyncResult({ ok: true, msg: 'Completing Google OAuth...' })
-
-      try {
-        const rawContext = sessionStorage.getItem('mia_google_oauth_context')
-        const ctx = rawContext ? JSON.parse(rawContext) : {}
-
-        await api.post('/api/v1/integrations/google/oauth/callback', {
-          code,
-          redirect_uri: ctx.redirect_uri || undefined,
-          calendar_id: ctx.calendar_id || 'primary',
-          client_id: ctx.client_id || undefined,
-          client_secret: ctx.client_secret || undefined,
-        })
-
-        sessionStorage.removeItem('mia_google_oauth_context')
-        setAutoSyncResult({ ok: true, msg: 'Google OAuth connected successfully' })
-        await qc.refetchQueries('integrations')
-        await qc.refetchQueries('capture-policy')
-      } catch (e: any) {
-        setAutoSyncResult({ ok: false, msg: e?.response?.data?.detail || 'Google OAuth callback failed' })
-      } finally {
-        navigate('/integrations', { replace: true })
-        setTimeout(() => setAutoSyncResult(null), 6000)
-      }
-    }
-
-    runGoogleOAuthCallback()
   }, [navigate, qc, searchParams])
 
   const {
@@ -602,19 +552,59 @@ export default function Integrations() {
     { onSuccess: () => qc.invalidateQueries('integrations') },
   )
 
+  // ── Meet bot join ─────────────────────────────────────────────────────────
+  const [joiningMeetUrl, setJoiningMeetUrl] = useState<string | null>(null)
+
+  const joinBotMutation = useMutation(
+    async (meetUrl: string) => {
+      console.log('[BOT] Integrations: Join Meet clicked —', meetUrl)
+      const res = await api.post('/api/v1/integrations/google/meet/join', {
+        meet_url: meetUrl,
+        stay_duration_seconds: 600,
+      })
+      console.log('[BOT] Integrations: API response', res.status, res.data)
+      return res.data
+    },
+    {
+      onMutate: (meetUrl) => {
+        setJoiningMeetUrl(meetUrl)
+        window.open(meetUrl, '_blank', 'noopener,noreferrer')
+      },
+      onSuccess: () => {
+        showIntegrationToast('Opened meeting tab · Bot is joining too…')
+      },
+      onError: (err: any) => {
+        const detail = err?.response?.data?.detail || err?.message || 'Failed to start bot'
+        console.error('[BOT] Integrations: join error', detail, err)
+        showIntegrationToast(`Error: ${detail}`, true)
+        setJoiningMeetUrl(null)
+      },
+      onSettled: () => {
+        // Keep joiningMeetUrl set so button shows loading until next render cycle
+        setTimeout(() => setJoiningMeetUrl(null), 3000)
+      },
+    },
+  )
+
   const handleTest = (id: string) => {
     setTestingId(id)
   }
 
   const performTest = async (id: string, data?: Record<string, any>) => {
     try {
-      const r = await api.post(`/api/v1/integrations/${id}/test`, data || {})
+      const integration = integrations.find(i => i.id === id)
+      const isGoogleOAuth = id === 'google' && integration?.config?.method === 'oauth'
+
+      const r = isGoogleOAuth
+        ? await api.get('/api/v1/integrations/google/test-oauth')
+        : await api.post(`/api/v1/integrations/${id}/test`, data || {})
+
       const d = r.data
       let msg = 'Test passed!'
       if (id === 'slack') msg = d.message || `Sent to ${d.channel}`
       if (id === 'linear') msg = `Teams: ${d.teams?.join(', ') || 'none found'}`
       if (id === 'zoom') msg = `Connected as ${d.user} (${d.email})`
-      if (id === 'google') msg = `Calendar: ${d.summary || d.calendar_id || 'connected'}`
+      if (id === 'google') msg = d.summary || `Calendar: ${d.calendar || d.calendar_id || 'connected'}`
       if (id === 'microsoft') msg = `Organization: ${d.organization}`
       setTestResult(t => ({ ...t, [id]: { msg, ok: true } }))
     } catch (e: any) {
@@ -1061,14 +1051,17 @@ export default function Integrations() {
                             {startDate}{attendeeCount > 0 ? ` · ${attendeeCount} attendee${attendeeCount !== 1 ? 's' : ''}` : ''}
                           </p>
                         </div>
-                        <a
-                          href={ev._meet_url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-lg hover:bg-green-100 font-medium"
+                        <button
+                          disabled={!ev._meet_url || joiningMeetUrl === ev._meet_url || joinBotMutation.isLoading}
+                          onClick={() => {
+                            console.log('[BOT] Join Meet button clicked —', ev._meet_url)
+                            if (!ev._meet_url) return
+                            joinBotMutation.mutate(ev._meet_url)
+                          }}
+                          className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-lg hover:bg-green-100 font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
                         >
-                          Join Meet
-                        </a>
+                          {joiningMeetUrl === ev._meet_url ? 'Starting…' : 'Join Meet'}
+                        </button>
                       </div>
                     )
                   })}
