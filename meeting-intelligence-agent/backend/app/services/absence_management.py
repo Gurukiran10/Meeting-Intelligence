@@ -17,7 +17,8 @@ from app.services.integrations.slack import slack_service
 
 logger = logging.getLogger(__name__)
 
-APP_BASE_URL = "http://localhost:3000"
+from app.core.config import settings as _settings
+APP_BASE_URL = _settings.FRONTEND_URL
 
 
 def _text(value: Any) -> str:
@@ -462,6 +463,18 @@ class AbsenceManagementService:
             meeting.meeting_metadata = meeting_metadata  # type: ignore[attr-defined]
             db.commit()
         return True
+
+
+    async def generate_catchup_for_user(self, db: Session, meeting: Meeting, user: User) -> Dict[str, Any]:
+        """Wrapper used by the meetings API endpoint."""
+        return await self.generate_catch_up_for_absentee(db, meeting, user)
+
+    async def send_catchup_to_user(self, db: Session, meeting: Meeting, user: User) -> bool:
+        """Generate and send catch-up to the user via Slack."""
+        catch_up = await self.generate_catch_up_for_absentee(db, meeting, user)
+        if not catch_up:
+            return False
+        return await self.send_catch_up_to_absentee(db, meeting, user, catch_up)
 
 
 absence_management_service = AbsenceManagementService()

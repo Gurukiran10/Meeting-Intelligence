@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     auto_sync_task: Optional[asyncio.Task] = None
     retention_task: Optional[asyncio.Task] = None
     auto_join_task: Optional[asyncio.Task] = None
+    zoom_auto_join_task: Optional[asyncio.Task] = None
 
     async def _auto_sync_loop():
         from app.api.v1.endpoints.integrations import run_integration_auto_sync_for_all_users
@@ -110,6 +111,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                                 continue
                             access_token = await _get_google_access_token(db=db, current_user=db_user)
 
+                            # Only join meetings that exist (not deleted) in the app DB
+                            from app.models.meeting import Meeting as MeetingModel
+                            active_meetings = db.execute(
+                                select(MeetingModel).where(
+                                    MeetingModel.organizer_id == user.id,
+                                    MeetingModel.platform == "google_meet",
+                                    MeetingModel.deleted_at.is_(None),
+                                    MeetingModel.external_id.isnot(None),
+                                )
+                            ).scalars().all()
+                            allowed_event_ids = {
+                                str(m.external_id) for m in active_meetings if m.external_id
+                            }
+
                         result = await auto_join_upcoming_meets(
                             user_id=str(user.id),
                             organization_id=str(user.organization_id),
@@ -118,6 +133,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                             stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
                             bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
                             recordings_dir=settings.RECORDINGS_DIR,
+                            allowed_event_ids=allowed_event_ids,
                         )
                         if result.get("triggered", 0):
                             logger.info(f"[AutoJoin] user={user.id} triggered={result['triggered']} meetings={result.get('meetings')}")
@@ -125,6 +141,63 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                         logger.debug(f"[AutoJoin] skipped user={user.id}: {user_exc}")
             except Exception as exc:
                 logger.error(f"[AutoJoin] scheduler loop error: {exc}", exc_info=True)
+
+    async def _zoom_auto_join_loop():
+        """
+        Every MEET_BOT_LEAD_TIME_MINUTES minutes, look for upcoming platform='zoom'
+        meetings in the DB and dispatch the Zoom bot to join them.
+        """
+        from app.services.zoom_bot import join_zoom_meeting
+        from app.models.meeting import Meeting as MeetingModel
+        from app.models.user import User as UserModel
+        from sqlalchemy import select
+        from datetime import timedelta
+
+        interval_seconds = max(settings.MEET_BOT_LEAD_TIME_MINUTES, 1) * 60
+
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if not settings.MEET_BOT_AUTO_JOIN_ENABLED:
+                continue
+            try:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                window_start = now - timedelta(minutes=settings.MEET_BOT_LEAD_TIME_MINUTES)
+                window_end = now + timedelta(minutes=settings.MEET_BOT_LEAD_TIME_MINUTES + 1)
+
+                with SessionLocal() as db:
+                    upcoming = db.execute(
+                        select(MeetingModel).where(
+                            MeetingModel.platform == "zoom",
+                            MeetingModel.deleted_at.is_(None),
+                            MeetingModel.status.in_(["scheduled", "pending"]),
+                            MeetingModel.scheduled_start >= window_start,
+                            MeetingModel.scheduled_start <= window_end,
+                            MeetingModel.meeting_url.isnot(None),
+                        )
+                    ).scalars().all()
+
+                for meeting in upcoming:
+                    try:
+                        meet_url = str(meeting.meeting_url or "").strip()
+                        if not meet_url:
+                            continue
+                        logger.info(
+                            f"[ZoomAutoJoin] meeting={meeting.id} title={meeting.title!r} url={meet_url}"
+                        )
+                        await join_zoom_meeting(
+                            zoom_url=meet_url,
+                            user_id=str(meeting.organizer_id),
+                            organization_id=str(meeting.organization_id or ""),
+                            meeting_id=str(meeting.id),
+                            bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
+                            stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
+                            recordings_dir=settings.RECORDINGS_DIR,
+                        )
+                    except Exception as zm_exc:
+                        logger.debug(f"[ZoomAutoJoin] skipped meeting={meeting.id}: {zm_exc}")
+            except Exception as exc:
+                logger.error(f"[ZoomAutoJoin] loop error: {exc}", exc_info=True)
 
     # Startup
     logger.info("Starting Meeting Intelligence Agent...")
@@ -151,8 +224,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     if settings.MEET_BOT_AUTO_JOIN_ENABLED:
         auto_join_task = asyncio.create_task(_auto_join_loop())
+        zoom_auto_join_task = asyncio.create_task(_zoom_auto_join_loop())
         logger.info(
-            f"[AutoJoin] scheduler enabled "
+            f"[AutoJoin] Google Meet + Zoom schedulers enabled "
             f"(check every {settings.MEET_BOT_LEAD_TIME_MINUTES} minutes, "
             f"stay {settings.MEET_BOT_STAY_DURATION_SECONDS}s)"
         )
@@ -193,6 +267,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         retention_task.cancel()
         try:
             await retention_task
+        except asyncio.CancelledError:
+            pass
+
+    if zoom_auto_join_task:
+        zoom_auto_join_task.cancel()
+        try:
+            await zoom_auto_join_task
         except asyncio.CancelledError:
             pass
 

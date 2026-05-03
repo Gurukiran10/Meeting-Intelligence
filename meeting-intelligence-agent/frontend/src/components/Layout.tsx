@@ -13,7 +13,9 @@ import {
   Plug,
   User as UserIcon,
   ChevronRight,
-  CheckCheck
+  CheckCheck,
+  Search,
+  UserX,
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { clearTokens, getAccessToken } from '../lib/auth'
@@ -90,10 +92,12 @@ const Layout: React.FC = () => {
   const navigation = [
     { name: 'Dashboard', to: '/dashboard', icon: LayoutDashboard },
     { name: 'Meetings', to: '/meetings', icon: Calendar },
+    { name: 'Search', to: '/search', icon: Search },
     { name: 'Action Items', to: '/action-items', icon: CheckSquare },
     { name: 'Mentions', to: '/mentions', icon: Bell },
     { name: 'Analytics', to: '/analytics', icon: BarChart3 },
     { name: 'Team', to: '/team', icon: Users },
+    { name: 'Absence', to: '/absence', icon: UserX },
     { name: 'Integrations', to: '/integrations', icon: Plug },
     { name: 'Settings', to: '/settings', icon: Settings },
   ]

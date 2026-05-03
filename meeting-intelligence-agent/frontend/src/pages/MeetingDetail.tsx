@@ -1,16 +1,285 @@
 import React, { useEffect, useMemo, useState } from 'react'
+
+const toLocalDate = (dt: string) => new Date(dt.endsWith('Z') || dt.includes('+') ? dt : dt + 'Z')
 import { useQuery } from 'react-query'
 import { Link, useParams } from 'react-router-dom'
-import { AlertCircle, Clock3, FileText, MessageSquareQuote, Mic, UploadCloud } from 'lucide-react'
+import { AlertCircle, Check, Clock3, Copy, ExternalLink, FileText, MessageSquareQuote, Mic, UploadCloud, ListChecks, Users2, GitBranch } from 'lucide-react'
 
 import { api } from '../lib/api'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 
+type ImportanceScore = {
+  label: 'critical' | 'important' | 'optional' | 'skip'
+  score: number
+  emoji: string
+  recommendation: string
+  reasons: string[]
+  warnings: string[]
+}
+
+const IMPORTANCE_BG: Record<string, string> = {
+  critical: 'bg-red-50 border-red-200',
+  important: 'bg-orange-50 border-orange-200',
+  optional: 'bg-yellow-50 border-yellow-200',
+  skip: 'bg-gray-50 border-gray-200',
+}
+const IMPORTANCE_TEXT: Record<string, string> = {
+  critical: 'text-red-700',
+  important: 'text-orange-700',
+  optional: 'text-yellow-700',
+  skip: 'text-gray-600',
+}
+
+const ImportanceCard: React.FC<{ importance: ImportanceScore }> = ({ importance }) => {
+  const bg = IMPORTANCE_BG[importance.label] ?? IMPORTANCE_BG.optional
+  const text = IMPORTANCE_TEXT[importance.label] ?? IMPORTANCE_TEXT.optional
+  return (
+    <Card className={`border shadow-sm ${bg}`}>
+      <CardContent className="pt-4 pb-4">
+        <div className="flex items-center justify-between mb-2">
+          <span className={`text-base font-semibold ${text}`}>
+            {importance.emoji} {importance.label.charAt(0).toUpperCase() + importance.label.slice(1)} Meeting
+            <span className="ml-2 text-xs font-normal opacity-70">({importance.score}/100)</span>
+          </span>
+        </div>
+        <p className={`text-sm mb-3 ${text}`}>{importance.recommendation}</p>
+        {importance.reasons.length > 0 && (
+          <ul className="space-y-1 mb-2">
+            {importance.reasons.map((r, i) => (
+              <li key={i} className="text-xs text-gray-600 flex items-start gap-1.5">
+                <span className="text-green-500 mt-0.5">✓</span>{r}
+              </li>
+            ))}
+          </ul>
+        )}
+        {importance.warnings.length > 0 && (
+          <ul className="space-y-1">
+            {importance.warnings.map((w, i) => (
+              <li key={i} className="text-xs text-gray-500 flex items-start gap-1.5">
+                <span className="text-yellow-500 mt-0.5">⚠</span>{w}
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+type ParticipationData = {
+  total_invited: number
+  total_speakers: number
+  silent_count: number
+  total_duration_seconds: number
+  speakers: { label: string; seconds: number; percent: number }[]
+  silent_attendees: { user_id: string; name: string; email: string }[]
+  recommendation: string
+  effectiveness_score: number
+}
+
+const ParticipationCard: React.FC<{ data: ParticipationData }> = ({ data }) => {
+  const score = data.effectiveness_score
+  const scoreColour = score >= 70 ? 'text-green-600' : score >= 40 ? 'text-yellow-600' : 'text-red-600'
+  const barColour = score >= 70 ? 'bg-green-500' : score >= 40 ? 'bg-yellow-400' : 'bg-red-400'
+
+  return (
+    <Card className="border-slate-200/60 shadow-sm">
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle className="text-lg font-semibold text-gray-900">Meeting Effectiveness</CardTitle>
+            <CardDescription>Who spoke vs who was invited</CardDescription>
+          </div>
+          <div className="text-right">
+            <span className={`text-3xl font-bold ${scoreColour}`}>{score}</span>
+            <span className="text-gray-400 text-sm">/100</span>
+          </div>
+        </div>
+        {/* Score bar */}
+        <div className="mt-2 h-2 w-full bg-gray-100 rounded-full overflow-hidden">
+          <div className={`h-full rounded-full ${barColour}`} style={{ width: `${score}%` }} />
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Summary stats */}
+        <div className="grid grid-cols-3 gap-3 text-center">
+          <div className="rounded-lg bg-slate-50 p-3">
+            <p className="text-2xl font-bold text-gray-900">{data.total_invited}</p>
+            <p className="text-xs text-gray-500">Invited</p>
+          </div>
+          <div className="rounded-lg bg-slate-50 p-3">
+            <p className="text-2xl font-bold text-green-600">{data.total_speakers}</p>
+            <p className="text-xs text-gray-500">Spoke</p>
+          </div>
+          <div className="rounded-lg bg-slate-50 p-3">
+            <p className={`text-2xl font-bold ${data.silent_count > 0 ? 'text-orange-500' : 'text-gray-400'}`}>{data.silent_count}</p>
+            <p className="text-xs text-gray-500">Silent</p>
+          </div>
+        </div>
+
+        {/* Speaker breakdown */}
+        {data.speakers.length > 0 && (
+          <div>
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Speaking Time</p>
+            <div className="space-y-2">
+              {data.speakers.map((s) => (
+                <div key={s.label}>
+                  <div className="flex justify-between text-xs text-gray-600 mb-0.5">
+                    <span className="font-medium">{s.label}</span>
+                    <span>{Math.floor(s.seconds / 60)}m {Math.round(s.seconds % 60)}s ({s.percent}%)</span>
+                  </div>
+                  <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                    <div className="h-full bg-indigo-500 rounded-full" style={{ width: `${s.percent}%` }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Silent attendees */}
+        {data.silent_attendees.length > 0 && (
+          <div>
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Did Not Speak</p>
+            <div className="flex flex-wrap gap-1.5">
+              {data.silent_attendees.map((a) => (
+                <span key={a.user_id} className="px-2 py-0.5 bg-orange-50 text-orange-700 text-xs rounded-full border border-orange-100">
+                  {a.name}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Recommendation */}
+        <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2">
+          <p className="text-xs text-blue-700">{data.recommendation}</p>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+const PRIORITY_DOT: Record<string, string> = {
+  high: 'bg-red-400',
+  urgent: 'bg-red-600',
+  medium: 'bg-amber-400',
+  low: 'bg-green-400',
+}
+
+const PrepCard: React.FC<{ data: any }> = ({ data }) => {
+  const suggestions: any[] = data?.agenda_suggestions ?? []
+  const attendeeOpts = data?.attendee_optimization ?? {}
+  const hasAgenda: boolean = data?.has_agenda ?? false
+
+  return (
+    <Card className="border-blue-100 bg-blue-50/30 shadow-sm">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-base font-semibold text-gray-900 flex items-center gap-2">
+          <ListChecks size={16} className="text-blue-500" />
+          Meeting Prep
+        </CardTitle>
+        <CardDescription>
+          {hasAgenda ? 'Agenda set · Suggested follow-ups below' : 'No agenda set yet — review suggestions'}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {suggestions.length > 0 && (
+          <div>
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Agenda Suggestions</p>
+            <ul className="space-y-2">
+              {suggestions.map((s: any, i: number) => (
+                <li key={i} className="flex items-start gap-2 text-sm">
+                  <span className={`mt-1.5 h-2 w-2 rounded-full shrink-0 ${PRIORITY_DOT[s.priority] ?? 'bg-gray-300'}`} />
+                  <div>
+                    <p className="text-gray-800">{s.text}</p>
+                    {s.detail && <p className="text-xs text-gray-400 mt-0.5">{s.detail}</p>}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {(attendeeOpts.add?.length > 0 || attendeeOpts.remove?.length > 0) && (
+          <div className="border-t border-blue-100 pt-3">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
+              <Users2 size={12} /> Attendee Suggestions
+              <span className="ml-1 normal-case font-normal text-gray-400">({attendeeOpts.current_count} → {attendeeOpts.suggested_count})</span>
+            </p>
+            {attendeeOpts.add?.length > 0 && (
+              <div className="mb-2">
+                <p className="text-xs text-green-700 font-medium mb-1">Add</p>
+                {attendeeOpts.add.map((u: any, i: number) => (
+                  <span key={i} className="inline-block mr-1 mb-1 text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded-full">{u.name}</span>
+                ))}
+              </div>
+            )}
+            {attendeeOpts.remove?.length > 0 && (
+              <div>
+                <p className="text-xs text-amber-700 font-medium mb-1">Consider removing</p>
+                {attendeeOpts.remove.map((u: any, i: number) => (
+                  <span key={i} className="inline-block mr-1 mb-1 text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">{u.name}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {suggestions.length === 0 && !attendeeOpts.add?.length && !attendeeOpts.remove?.length && (
+          <p className="text-sm text-gray-400">No prep suggestions — meeting looks good to go.</p>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+const DecisionThreadCard: React.FC<{ threads: any[] }> = ({ threads }) => {
+  if (!threads?.length) return null
+  return (
+    <Card className="border-violet-100 bg-violet-50/20 shadow-sm">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-base font-semibold text-gray-900 flex items-center gap-2">
+          <GitBranch size={16} className="text-violet-500" />
+          Decision Evolution
+        </CardTitle>
+        <CardDescription>How decisions from this meeting relate to past discussions</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {threads.slice(0, 5).map((thread: any, i: number) => (
+          <div key={i} className="rounded-lg border border-violet-100 bg-white p-3">
+            <div className="flex items-start justify-between gap-2 mb-1">
+              <p className="text-sm font-medium text-gray-800 leading-snug">{thread.topic}</p>
+              {thread.revisited && (
+                <span className="shrink-0 text-xs bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded">revisited</span>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1 mt-2">
+              {thread.meetings?.map((m: any, j: number) => (
+                <span key={j} className="text-xs text-gray-400 bg-gray-50 border border-gray-100 rounded px-1.5 py-0.5">
+                  {m.meeting_title} · {m.date ? new Date(m.date).toLocaleDateString() : '—'}
+                </span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  )
+}
+
 const MeetingDetail: React.FC = () => {
   const { id } = useParams()
   const [isUploading, setIsUploading] = useState(false)
   const [uploadMessage, setUploadMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const copyMeetingUrl = (url: string) => {
+    navigator.clipboard.writeText(url)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   const { data: meeting, isLoading, refetch } = useQuery(
     ['meeting', id],
@@ -51,10 +320,37 @@ const MeetingDetail: React.FC = () => {
     { enabled: Boolean(id) },
   )
 
+  const { data: participation } = useQuery(
+    ['meeting-participation', id],
+    async () => {
+      const response = await api.get(`/api/v1/meetings/${id}/participation`)
+      return response.data
+    },
+    { enabled: Boolean(id) && meeting?.status === 'completed' },
+  )
+
   const { data: preBrief } = useQuery(
     ['meeting-pre-brief', id],
     async () => {
       const response = await api.get(`/api/v1/meetings/${id}/pre-brief`)
+      return response.data
+    },
+    { enabled: Boolean(id) },
+  )
+
+  const { data: prepData } = useQuery(
+    ['meeting-prep', id],
+    async () => {
+      const response = await api.get(`/api/v1/meetings/${id}/prep`)
+      return response.data
+    },
+    { enabled: Boolean(id) && meeting?.status === 'scheduled' },
+  )
+
+  const { data: decisionGraph } = useQuery(
+    ['decision-graph'],
+    async () => {
+      const response = await api.get('/api/v1/decisions/graph?days=90')
       return response.data
     },
     { enabled: Boolean(id) },
@@ -213,15 +509,43 @@ const MeetingDetail: React.FC = () => {
             </div>
             <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-4">
               <p className="text-gray-500">Scheduled Start</p>
-              <p className="font-medium text-gray-900">{new Date(meeting.scheduled_start).toLocaleString()}</p>
+              <p className="font-medium text-gray-900">{toLocalDate(meeting.scheduled_start).toLocaleString()}</p>
             </div>
             <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-4">
               <p className="text-gray-500">Scheduled End</p>
-              <p className="font-medium text-gray-900">{new Date(meeting.scheduled_end).toLocaleString()}</p>
+              <p className="font-medium text-gray-900">{toLocalDate(meeting.scheduled_end).toLocaleString()}</p>
             </div>
           </div>
+
+          {meeting.meeting_url && (
+            <div className="mt-4 flex items-center gap-3 rounded-xl border border-blue-100 bg-blue-50/60 px-4 py-3">
+              <ExternalLink className="w-4 h-4 text-blue-500 shrink-0" />
+              <span className="flex-1 text-sm font-mono text-blue-800 truncate">{meeting.meeting_url}</span>
+              <button
+                onClick={() => copyMeetingUrl(meeting.meeting_url)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-blue-200 bg-white text-xs font-medium text-blue-700 hover:bg-blue-50 transition-colors shrink-0"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
+                {copied ? 'Copied!' : 'Copy'}
+              </button>
+              <a
+                href={meeting.meeting_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 transition-colors shrink-0"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                Join
+              </a>
+            </div>
+          )}
         </CardContent>
       </Card>
+
+      {meeting.importance && <ImportanceCard importance={meeting.importance} />}
+      {participation && meeting?.status === 'completed' && <ParticipationCard data={participation} />}
+      {prepData && meeting?.status === 'scheduled' && <PrepCard data={prepData} />}
+      {decisionGraph?.threads?.length > 0 && <DecisionThreadCard threads={decisionGraph.threads} />}
 
       <Card className="border-slate-200/60 shadow-sm">
         <CardHeader>
@@ -390,7 +714,7 @@ const MeetingDetail: React.FC = () => {
                       <Badge variant="outline" className="capitalize">{task.status}</Badge>
                     </div>
                     <div className="mt-2 text-xs text-slate-500">
-                      Priority {task.priority || 'medium'}{task.due_date ? ` • Due ${new Date(task.due_date).toLocaleString()}` : ''}
+                      Priority {task.priority || 'medium'}{task.due_date ? ` • Due ${toLocalDate(task.due_date).toLocaleString()}` : ''}
                     </div>
                   </div>
                 )) : (

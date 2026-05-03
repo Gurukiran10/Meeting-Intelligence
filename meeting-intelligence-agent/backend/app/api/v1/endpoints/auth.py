@@ -454,7 +454,7 @@ async def google_login(
         "client_id": req.client_id,
         "response_type": "code",
         "redirect_uri": redirect_uri,           # always backend URL from env
-        "scope": "openid email profile https://www.googleapis.com/auth/calendar.readonly",
+        "scope": "openid email profile https://www.googleapis.com/auth/calendar.events",
         "access_type": "offline",
         "prompt": "consent",
         "state": str(current_user.id),

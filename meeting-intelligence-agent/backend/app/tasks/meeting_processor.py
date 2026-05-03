@@ -9,6 +9,7 @@ from typing import List, Optional
 from uuid import UUID
 from celery import shared_task
 from app.core.database import SessionLocal
+from app.core.config import settings
 from app.services.ai.transcription import transcription_service
 from app.services.ai.nlp import nlp_service
 from app.services.integrations.slack import slack_service
@@ -80,6 +81,33 @@ def _assign_speakers(segments):
             current_speaker = 2 if current_speaker == 1 else 1
         seg.speaker = f"Speaker {current_speaker}"
         prev_end = seg.end
+
+
+def _remap_speaker_names(segments, attendee_names: list[str]) -> None:
+    """Replace generic 'Speaker N' labels with real attendee names.
+
+    Maps labels in order of first appearance to attendee_names.
+    Any speaker beyond the known attendees becomes 'Guest N'.
+    """
+    if not segments or not attendee_names:
+        return
+    seen: dict[str, int] = {}
+    for seg in segments:
+        if seg.speaker and seg.speaker not in seen:
+            seen[seg.speaker] = len(seen)
+
+    label_map: dict[str, str] = {}
+    guest_counter = 1
+    for label, idx in seen.items():
+        if idx < len(attendee_names):
+            label_map[label] = attendee_names[idx]
+        else:
+            label_map[label] = f"Guest {guest_counter}"
+            guest_counter += 1
+
+    for seg in segments:
+        if seg.speaker in label_map:
+            seg.speaker = label_map[seg.speaker]
 
 
 def _match_user_by_name(users: List[User], owner_name: Optional[str]) -> Optional[User]:
@@ -196,18 +224,55 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
             meeting.transcription_status = "processing"  # type: ignore
             db.commit()
 
+            # Collect attendee display names for speaker mapping
+            seen_user_ids: set[str] = set()
+            attendee_names: list[str] = []
+
+            def _add_user_name(user_id) -> None:
+                uid_str = str(user_id)
+                if uid_str in seen_user_ids:
+                    return
+                seen_user_ids.add(uid_str)
+                u = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+                if u:
+                    name = str(u.full_name or u.username or u.email or "").strip()
+                    if name:
+                        attendee_names.append(name)
+
+            # Organizer first (most likely Speaker 1 in recordings)
+            if meeting.organizer_id:
+                _add_user_name(meeting.organizer_id)
+            # Created-by user (bot-joined meetings populate this, not organizer_id)
+            if meeting.created_by:
+                _add_user_name(meeting.created_by)
+            # Remaining attendees
+            for uid in list(meeting.attendee_ids or []):
+                _add_user_name(uid)
+
             transcription = await transcription_service.transcribe_audio(
                 recording_path,
                 enable_diarization=True,
+                attendee_names=attendee_names,
             )
             if not transcription.segments:
                 raise RuntimeError("Transcript is empty")
 
-            # Filter Whisper silence hallucinations, then assign speaker labels
+            # Filter Whisper silence hallucinations
             transcription.segments = _filter_hallucinations(transcription.segments)
             if not transcription.segments:
                 raise RuntimeError("Transcript is empty after hallucination filtering")
-            _assign_speakers(transcription.segments)
+
+            # Only apply gap heuristic if AssemblyAI did NOT handle diarization
+            if transcription.diarization_method != "assemblyai":
+                _assign_speakers(transcription.segments)
+                _remap_speaker_names(transcription.segments, attendee_names)
+                logger.info(
+                    "Speaker labels assigned via gap heuristic → names: %s",
+                    list({s.speaker for s in transcription.segments}),
+                )
+            else:
+                logger.info("Speaker labels from AssemblyAI diarization: %s",
+                            list({s.speaker for s in transcription.segments}))
 
             # Save transcripts
             for idx, segment in enumerate(transcription.segments):
@@ -400,7 +465,7 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                 message = (
                     f"👋 You were mentioned in a meeting\n\n"
                     f"📌 Meeting: {meeting.title}\n"
-                    f"📎 View: http://localhost:3002/meetings/{meeting.id}\n"
+                    f"📎 View: {settings.FRONTEND_URL}/meetings/{meeting.id}\n"
                 )
                 if user_tasks:
                     task = user_tasks[0]
@@ -429,7 +494,11 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                 )
 
                 if matched_user.slack_user_id:
-                    send_slack_dm(matched_user.slack_user_id, message)
+                    slack_token = (
+                        (matched_user.integrations or {}).get("slack", {}).get("bot_token")
+                        or getattr(settings, "SLACK_BOT_TOKEN", None)
+                    )
+                    send_slack_dm(matched_user.slack_user_id, message, bot_token=slack_token)
 
             logger.info(f"Saved {saved_mention_count} quality mentions from LLM extraction (raw count: {len(summary.mentions)})")
 
@@ -575,9 +644,116 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
                         api_key=linear_creds["api_key"],
                         meeting_title=str(meeting.title),
                         action_items=summary.action_items,
+                        db=db,
+                        meeting_id=meeting.id,
                     )
                 except Exception as linear_err:
                     logger.warning(f"Linear sync failed (non-fatal): {linear_err}")
+
+        # Step 5: Email summary via Resend (non-critical)
+        if summary and getattr(settings, "RESEND_API_KEY", ""):
+            try:
+                from app.services.email_service import email_service
+                attendee_emails: list[str] = []
+                for uid in list(meeting.attendee_ids or []):
+                    u = db.execute(select(User).where(User.id == uid)).scalar_one_or_none()
+                    if u and u.email:
+                        attendee_emails.append(str(u.email))
+                if organizer and organizer.email and str(organizer.email) not in attendee_emails:
+                    attendee_emails.append(str(organizer.email))
+                if attendee_emails:
+                    await email_service.send_meeting_summary(
+                        recipients=attendee_emails,
+                        meeting_title=str(meeting.title),
+                        meeting_id=str(meeting.id),
+                        scheduled_start=meeting.scheduled_start,
+                        executive_summary=summary.executive_summary or "",
+                        decisions=[d.model_dump() for d in summary.decisions],
+                        action_items=[
+                            {"title": a.title, "owner": a.owner, "due_date": a.due_date, "priority": a.priority}
+                            for a in summary.action_items
+                        ],
+                    )
+                    logger.info(f"Email summary sent to {len(attendee_emails)} attendees for meeting {meeting_id}")
+            except Exception as email_err:
+                logger.warning(f"Email summary failed (non-fatal): {email_err}")
+
+        # Step 6: Absentee catch-up — in-app bell + Slack + email (non-critical)
+        try:
+            from app.services.absence_management import absence_management_service
+            from app.services.email_service import email_service as _email_svc
+            absentees = absence_management_service.find_absentees_for_meeting(db, meeting)
+            if absentees:
+                logger.info(f"Sending catch-up to {len(absentees)} absentee(s) for meeting {meeting_id}")
+            for absentee in absentees:
+                try:
+                    catch_up = await absence_management_service.generate_catch_up_for_absentee(db, meeting, absentee)
+                    if not catch_up:
+                        continue
+
+                    actions_assigned = catch_up.get("actions_assigned", [])
+                    decisions = catch_up.get("decisions_affecting_work", [])
+                    skip_rec = catch_up.get("skip_recommendation", {})
+
+                    # Build plain-text bell message
+                    bell_msg = (
+                        f"📋 You missed: {meeting.title}\n"
+                        f"📅 {meeting.scheduled_start.strftime('%b %d, %Y at %H:%M') if meeting.scheduled_start else ''}\n"
+                    )
+                    if actions_assigned:
+                        titles = ", ".join(a["task"] for a in actions_assigned[:2])
+                        bell_msg += f"\n⚡ Action items assigned to you: {titles}"
+                    if decisions:
+                        bell_msg += f"\n🔑 {len(decisions)} decision(s) may affect your work"
+                    if skip_rec.get("recommendation") == "safe_to_skip":
+                        bell_msg += "\n✅ Safe to skip future similar meetings"
+                    bell_msg += f"\n🔗 {settings.FRONTEND_URL}/meetings/{meeting.id}"
+
+                    # 1. In-app notification (always)
+                    create_notification(
+                        db,
+                        user_id=absentee.id,
+                        organization_id=meeting.organization_id,
+                        notification_type="meeting_missed",
+                        message=bell_msg,
+                        notification_metadata={
+                            "meeting_id": str(meeting.id),
+                            "catch_up": {
+                                "actions_count": len(actions_assigned),
+                                "decisions_count": len(decisions),
+                                "skip_recommendation": skip_rec.get("recommendation"),
+                            },
+                        },
+                    )
+                    db.commit()
+
+                    # 2. Slack DM (if connected)
+                    try:
+                        await absence_management_service.send_catch_up_to_absentee(db, meeting, absentee, catch_up)
+                        logger.info(f"Slack catch-up sent to {absentee.email} for meeting {meeting_id}")
+                    except Exception as slack_err:
+                        logger.warning(f"Slack catch-up failed for {absentee.email} (non-fatal): {slack_err}")
+
+                    # 3. Email (if Resend configured)
+                    if absentee.email and getattr(settings, "RESEND_API_KEY", ""):
+                        try:
+                            await _email_svc.send_absentee_catchup(
+                                recipient_email=str(absentee.email),
+                                meeting_title=str(meeting.title),
+                                meeting_id=str(meeting.id),
+                                scheduled_start=meeting.scheduled_start,
+                                actions_assigned=actions_assigned,
+                                decisions=decisions,
+                                skip_recommendation=skip_rec,
+                            )
+                            logger.info(f"Email catch-up sent to {absentee.email} for meeting {meeting_id}")
+                        except Exception as email_err:
+                            logger.warning(f"Email catch-up failed for {absentee.email} (non-fatal): {email_err}")
+
+                except Exception as absentee_err:
+                    logger.warning(f"Catch-up failed for {getattr(absentee, 'email', '?')} (non-fatal): {absentee_err}")
+        except Exception as e:
+            logger.warning(f"Absentee catch-up step failed (non-fatal): {e}")
 
         logger.info(f"Meeting {meeting_id} processing pipeline finished")
 
@@ -664,12 +840,11 @@ async def _notify_slack(token: str, channel: str, meeting: "Meeting", action_cou
 
 # ─── Linear helper ───────────────────────────────────────────────────────────
 
-async def _create_linear_issues(api_key: str, meeting_title: str, action_items: list):
-    """Create Linear issues for each extracted action item."""
+async def _create_linear_issues(api_key: str, meeting_title: str, action_items: list, db=None, meeting_id=None):
+    """Create Linear issues for each extracted action item and save URLs back to DB."""
     import httpx
 
-    # First, get the first available team id
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(
             "https://api.linear.app/graphql",
             headers={"Authorization": api_key, "Content-Type": "application/json"},
@@ -681,21 +856,47 @@ async def _create_linear_issues(api_key: str, meeting_title: str, action_items: 
         return
 
     team_id = teams[0]["id"]
+    mutation = """
+    mutation CreateIssue($teamId: String!, $title: String!, $description: String) {
+      issueCreate(input: { teamId: $teamId, title: $title, description: $description }) {
+        success
+        issue { id identifier url }
+      }
+    }
+    """
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         for item in action_items[:10]:  # cap at 10 to avoid flooding
-            mutation = """
-            mutation CreateIssue($teamId: String!, $title: String!, $description: String) {
-              issueCreate(input: { teamId: $teamId, title: $title, description: $description }) {
-                success
-                issue { id identifier url }
-              }
-            }
-            """
             desc = f"Auto-created from meeting: **{meeting_title}**\n\n{item.description or ''}"
-            await client.post(
+            resp = await client.post(
                 "https://api.linear.app/graphql",
                 headers={"Authorization": api_key, "Content-Type": "application/json"},
                 json={"query": mutation, "variables": {"teamId": team_id, "title": item.title, "description": desc}},
             )
-            logger.info(f"Created Linear issue for action: {item.title}")
+            issue_data = resp.json().get("data", {}).get("issueCreate", {}).get("issue") or {}
+            issue_url = issue_data.get("url")
+            issue_id = issue_data.get("identifier")
+            logger.info(f"Created Linear issue for action: {item.title} → {issue_url}")
+
+            # Save the Linear URL back to the ActionItem row
+            if db is not None and meeting_id is not None and (issue_url or issue_id):
+                try:
+                    db_item = db.execute(
+                        select(ActionItem).where(
+                            ActionItem.meeting_id == meeting_id,
+                            ActionItem.title == item.title[:500],
+                        )
+                    ).scalar_one_or_none()
+                    if db_item:
+                        db_item.external_task_id = issue_id  # type: ignore
+                        db_item.external_task_url = issue_url  # type: ignore
+                        db_item.integration_type = "linear"  # type: ignore
+                        db_item.sync_status = "synced"  # type: ignore
+                except Exception as db_err:
+                    logger.warning(f"Could not save Linear URL to ActionItem: {db_err}")
+
+    if db is not None:
+        try:
+            db.commit()
+        except Exception:
+            pass

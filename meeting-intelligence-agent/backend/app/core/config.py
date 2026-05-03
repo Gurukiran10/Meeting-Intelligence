@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
+    # AssemblyAI (real speaker diarization)
+    ASSEMBLYAI_API_KEY: str = ""
+
     # Grok (xAI)
     GROK_API_KEY: str = ""
     GROK_BASE_URL: str = "https://api.x.ai/v1"

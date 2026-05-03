@@ -1197,7 +1197,39 @@ async def connect_slack(
         "team_name": data.get("team"),
         "bot_name": data.get("user"),
     })
-    return {"status": "connected", "team": data.get("team"), "bot": data.get("user"), "channel": target_channel}
+
+    # Look up the user's Slack member ID by email so DMs can be sent to them
+    slack_member_id: str | None = None
+    if current_user.email:
+        try:
+            async with httpx.AsyncClient() as client:
+                lookup = await client.get(
+                    "https://slack.com/api/users.lookupByEmail",
+                    headers={"Authorization": f"Bearer {req.bot_token}"},
+                    params={"email": current_user.email},
+                )
+            lookup_data = lookup.json()
+            if lookup_data.get("ok"):
+                slack_member_id = lookup_data["user"]["id"]
+                current_user.slack_user_id = slack_member_id
+                db.commit()
+                logger.info("Slack user ID saved for user %s: %s", current_user.id, slack_member_id)
+            else:
+                logger.warning(
+                    "Slack users.lookupByEmail failed for %s: %s",
+                    current_user.email,
+                    lookup_data.get("error"),
+                )
+        except Exception as exc:
+            logger.warning("Slack user lookup error (non-fatal): %s", exc)
+
+    return {
+        "status": "connected",
+        "team": data.get("team"),
+        "bot": data.get("user"),
+        "channel": target_channel,
+        "slack_user_id": slack_member_id,
+    }
 
 
 @router.delete("/slack/disconnect")
@@ -1768,9 +1800,7 @@ async def google_oauth_url(
             "response_type": "code",
             "redirect_uri": resolved_redirect_uri,
             "scope": (
-                "https://www.googleapis.com/auth/calendar.readonly "
-                "https://www.googleapis.com/auth/calendar.events.readonly "
-                "https://www.googleapis.com/auth/meetings.space.readonly "
+                "https://www.googleapis.com/auth/calendar.events "
                 "openid email profile"
             ),
             "access_type": "offline",
@@ -2219,6 +2249,65 @@ async def stop_meet_bot(
     from app.services.meet_bot import stop_bot
 
     stopped = await stop_bot(str(current_user.id))
+    return {"stopped": stopped}
+
+
+# ── Zoom bot ──────────────────────────────────────────────────────────────────
+
+class ZoomBotJoinRequest(BaseModel):
+    zoom_url: str
+    stay_duration_seconds: int = 600
+    bot_display_name: str = "SyncMinds Bot"
+
+
+@router.post("/zoom/bot/join")
+async def join_zoom_with_bot(
+    req: ZoomBotJoinRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Launch the Zoom bot to join a meeting and record it."""
+    from app.services.zoom_bot import join_zoom_meeting, is_valid_zoom_url
+
+    if not is_valid_zoom_url(req.zoom_url):
+        raise HTTPException(status_code=400, detail="Invalid Zoom meeting URL")
+
+    user_id = str(current_user.id)
+    org_id = str(current_user.organization_id)
+
+    asyncio.create_task(
+        join_zoom_meeting(
+            zoom_url=req.zoom_url,
+            user_id=user_id,
+            organization_id=org_id,
+            bot_display_name=req.bot_display_name,
+            stay_duration_seconds=req.stay_duration_seconds,
+        )
+    )
+    return {"status": "launched", "zoom_url": req.zoom_url, "user_id": user_id}
+
+
+@router.get("/zoom/bot/status")
+async def get_zoom_bot_status(
+    current_user: User = Depends(get_current_user),
+):
+    """Return the current Zoom bot session status for this user."""
+    from app.services.zoom_bot import get_zoom_bot_status
+
+    session = get_zoom_bot_status(str(current_user.id))
+    if not session:
+        return {"status": "idle", "zoom_url": None}
+    return session
+
+
+@router.delete("/zoom/bot/join")
+async def stop_zoom_bot_endpoint(
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel the running Zoom bot session for this user."""
+    from app.services.zoom_bot import stop_zoom_bot
+
+    stopped = await stop_zoom_bot(str(current_user.id))
     return {"stopped": stopped}
 
 

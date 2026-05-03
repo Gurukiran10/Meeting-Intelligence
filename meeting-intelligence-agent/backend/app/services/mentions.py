@@ -22,7 +22,8 @@ from app.services.slack_service import send_slack_dm
 logger = logging.getLogger(__name__)
 
 
-MENTION_ALERT_BASE_URL = "http://localhost:3000"
+from app.core.config import settings as _settings
+MENTION_ALERT_BASE_URL = _settings.FRONTEND_URL
 
 
 def _as_optional_str(value: Any) -> Optional[str]:
@@ -250,6 +251,69 @@ def _build_alert_details(db: Session, meeting: Meeting, user: User, detection: M
     }
 
 
+async def _send_mention_email(
+    recipient_email: str,
+    recipient_name: str,
+    meeting_title: str,
+    meeting_link: str,
+    mention_text: str,
+    mention_context: str,
+    mention_type: str,
+    alert_details: Dict[str, Any],
+) -> None:
+    from app.core.config import settings as _cfg
+    resend_key = getattr(_cfg, "RESEND_API_KEY", "")
+    from_email = getattr(_cfg, "FROM_EMAIL", "noreply@syncminds.ai")
+    if not resend_key:
+        logger.warning("RESEND_API_KEY not set — skipping mention email to %s", recipient_email)
+        return
+
+    import resend as _resend  # type: ignore
+    _resend.api_key = resend_key
+
+    type_label = {
+        "action_assignment": "Action Item Assigned",
+        "decision_impact": "Decision Affects You",
+        "question": "Question for You",
+        "feedback": "You Received Feedback",
+        "resource_request": "Resource Requested",
+    }.get(mention_type, "You Were Mentioned")
+
+    task_line = f"<p><strong>Task:</strong> {alert_details['dependency']}</p>" if alert_details.get("dependency") else ""
+    due_line = f"<p><strong>Due:</strong> {alert_details['due_date']}</p>" if alert_details.get("due_date") else ""
+    context_snippet = (mention_context or mention_text)[:300]
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+      <h2 style="color:#1a56db">SyncMinds — {type_label}</h2>
+      <p>Hi {recipient_name},</p>
+      <p>You were mentioned in <strong>{meeting_title}</strong>.</p>
+      <blockquote style="border-left:4px solid #1a56db;padding:8px 16px;color:#555;margin:16px 0">
+        {context_snippet}
+      </blockquote>
+      {task_line}
+      {due_line}
+      <p>
+        <a href="{meeting_link}" style="background:#1a56db;color:#fff;padding:10px 20px;
+           text-decoration:none;border-radius:4px;display:inline-block">
+          View Meeting
+        </a>
+      </p>
+      <hr style="border:none;border-top:1px solid #eee;margin-top:32px"/>
+      <p style="font-size:12px;color:#999">SyncMinds Meeting Intelligence</p>
+    </div>
+    """
+
+    params: Dict[str, Any] = {
+        "from": f"SyncMinds <{from_email}>",
+        "to": [recipient_email],
+        "subject": f"[SyncMinds] {type_label} — {meeting_title}",
+        "html": html,
+    }
+    resp = _resend.Emails.send(params)
+    logger.info("Mention email sent to %s — resend id=%s", recipient_email, getattr(resp, "id", resp))
+
+
 async def detect_and_store_mentions(
     db: Session,
     meeting: Meeting,
@@ -420,12 +484,32 @@ async def detect_and_store_mentions(
 
             # ── Personal Slack DM via slack_user_id (simple path) ───────
             elif matched_user.slack_user_id:
-                send_slack_dm(matched_user.slack_user_id, rich_message)
+                from app.core.config import settings as _settings
+                _slack_token = (
+                    slack_settings.get("bot_token")
+                    or getattr(_settings, "SLACK_BOT_TOKEN", None)
+                )
+                send_slack_dm(matched_user.slack_user_id, rich_message, bot_token=_slack_token)
 
-            # Email alert (placeholder for future implementation)
+            # Email alert via Resend
             if "email" in alert_channels and notification_settings.get("email_enabled", True) and recipient_email:
-                # TODO: Implement email alert logic
-                pass
+                try:
+                    await _send_mention_email(
+                        recipient_email=recipient_email,
+                        recipient_name=str(matched_user.full_name or matched_user.username or recipient_email),
+                        meeting_title=str(meeting.title),
+                        meeting_link=meeting_link,
+                        mention_text=detection.text,
+                        mention_context=detection.context or "",
+                        mention_type=detection.mention_type,
+                        alert_details=alert_details,
+                    )
+                    if not getattr(mention, "notification_sent", False):
+                        setattr(mention, "notification_sent", True)
+                        setattr(mention, "notification_sent_at", datetime.utcnow())
+                        setattr(mention, "notification_type", "email")
+                except Exception as exc:
+                    logger.warning("Failed to send mention email to %s: %s", recipient_email, exc)
 
         created_mentions.append(mention)
 

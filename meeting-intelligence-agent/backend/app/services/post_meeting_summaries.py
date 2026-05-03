@@ -20,7 +20,8 @@ from app.services.integrations.slack import slack_service
 
 logger = logging.getLogger(__name__)
 
-APP_BASE_URL = "http://localhost:3000"
+from app.core.config import settings as _settings
+APP_BASE_URL = _settings.FRONTEND_URL
 
 
 def _text(value: Any) -> str:

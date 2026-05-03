@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.v1.endpoints.auth import _serialize_user, _set_auth_cookies, require_admin
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import create_access_token, create_refresh_token, get_password_hash
 from app.models.invite import Invite
@@ -63,7 +64,7 @@ class AcceptInviteResponse(BaseModel):
 
 
 def _invite_link(token: str) -> str:
-    return f"http://localhost:3002/login?invite={token}"
+    return f"{settings.FRONTEND_URL}/login?invite={token}"
 
 
 @router.get("/invite-preview", response_model=InvitePreviewResponse)

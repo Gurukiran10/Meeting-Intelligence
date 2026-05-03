@@ -545,18 +545,9 @@ class PreMeetingBriefService:
 
         try:
             blocks = self._build_brief_blocks(meeting, brief)
-            await slack_service.send_mention_alert_via_token(
+            await slack_service.send_blocks_via_token(
                 bot_token=slack_settings["bot_token"],
-                recipient_email=str(getattr(user, "email", "")),
-                mention_data={"type": "pre_meeting_brief"},
-                meeting_title=str(getattr(meeting, "title", "")),
-                meeting_url=f"http://localhost:3000/meetings/{getattr(meeting, 'id', '')}",
-            )
-            # Actually send the brief
-            _username = str(getattr(user, "username", "") or "")
-            _email = str(getattr(user, "email", "") or "")
-            await slack_service.send_message(
-                channel=_username or _email.split("@")[0],
+                recipient_email=str(user.email or ""),
                 text=f"📋 Pre-Meeting Brief: {meeting.title}",
                 blocks=blocks,
             )

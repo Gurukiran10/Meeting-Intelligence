@@ -2,7 +2,7 @@
 from typing import List, Optional
 from datetime import datetime
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import select, or_, case, cast, String
 from pydantic import BaseModel, ConfigDict
@@ -341,3 +341,70 @@ async def complete_action_item(
     db.refresh(item)
     
     return item
+
+
+@router.delete("/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_action_item(
+    item_id: UUID,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Delete an action item (admin or assignee only)"""
+    item = db.execute(
+        select(ActionItem).where(
+            ActionItem.id == item_id,
+            ActionItem.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action item not found")
+
+    if (
+        current_user.role != "admin"
+        and item.assigned_to_user_id != current_user.id
+        and str(current_user.id) not in (item.collaborator_ids or [])
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    db.delete(item)
+    db.commit()
+
+
+@router.delete("/", status_code=status.HTTP_200_OK)
+async def bulk_delete_action_items(
+    ids: List[UUID] = Query(...),
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Bulk delete action items by list of IDs (admin or assignee)"""
+    items = db.execute(
+        select(ActionItem).where(
+            ActionItem.id.in_(ids),
+            ActionItem.organization_id == current_user.organization_id,
+        )
+    ).scalars().all()
+
+    for item in items:
+        if (
+            current_user.role != "admin"
+            and item.assigned_to_user_id != current_user.id
+            and str(current_user.id) not in (item.collaborator_ids or [])
+        ):
+            continue
+        db.delete(item)
+
+    db.commit()
+    return {"deleted": len(items)}
+
+
+@router.post("/reminders/trigger", tags=["Action Items"])
+async def trigger_reminders(
+    current_user: User = Depends(require_org_member),
+):
+    """Manually trigger the action item reminder task (admin only, for testing)."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+    from app.tasks.action_item_reminders import send_action_item_reminders
+    task = send_action_item_reminders.delay()
+    return {"status": "queued", "task_id": str(task.id)}

@@ -438,6 +438,7 @@ export default function Integrations() {
   const [syncingId, setSyncingId] = useState<string | null>(null)
   const [historyImportingId, setHistoryImportingId] = useState<string | null>(null)
   const [zoomHistoryDaysBack, setZoomHistoryDaysBack] = useState<number>(30)
+  const [zoomBotJoiningUrl, setZoomBotJoiningUrl] = useState<string | null>(null)
   const [autoSyncRunning, setAutoSyncRunning] = useState(false)
   const [autoJoinRunning, setAutoJoinRunning] = useState(false)
   const [autoSyncSavingPlatform, setAutoSyncSavingPlatform] = useState<string | null>(null)
@@ -453,7 +454,11 @@ export default function Integrations() {
     respect_no_record_requests: true,
     smart_recording_enabled: true,
     min_team_size: 1,
+    include_keywords: [] as string[],
+    exclude_keywords: [] as string[],
+    required_tags: [] as string[],
   })
+  const [keywordInputs, setKeywordInputs] = useState({ include: '', exclude: '', tags: '' })
 
   useEffect(() => {
     const googleParam = searchParams.get('google')
@@ -507,6 +512,9 @@ export default function Integrations() {
       respect_no_record_requests: boolean
       smart_recording_enabled: boolean
       min_team_size: number
+      include_keywords: string[]
+      exclude_keywords: string[]
+      required_tags: string[]
     }),
     {
       retry: 1,
@@ -519,6 +527,9 @@ export default function Integrations() {
           respect_no_record_requests: !!data.respect_no_record_requests,
           smart_recording_enabled: !!data.smart_recording_enabled,
           min_team_size: Number(data.min_team_size || 1),
+          include_keywords: Array.isArray(data.include_keywords) ? data.include_keywords : [],
+          exclude_keywords: Array.isArray(data.exclude_keywords) ? data.exclude_keywords : [],
+          required_tags: Array.isArray(data.required_tags) ? data.required_tags : [],
         })
       },
     },
@@ -912,6 +923,65 @@ export default function Integrations() {
               />
             </label>
           </div>
+
+          {/* Keyword & tag filters */}
+          {capturePolicyForm.smart_recording_enabled && (
+            <div className="mt-3 space-y-3 border-t border-gray-100 pt-3">
+              {(
+                [
+                  { label: 'Only record if title contains', key: 'include_keywords', inputKey: 'include', placeholder: 'e.g. standup' },
+                  { label: 'Skip if title contains', key: 'exclude_keywords', inputKey: 'exclude', placeholder: 'e.g. social' },
+                  { label: 'Required tags', key: 'required_tags', inputKey: 'tags', placeholder: 'e.g. engineering' },
+                ] as const
+              ).map(({ label, key, inputKey, placeholder }) => (
+                <div key={key}>
+                  <p className="text-xs font-medium text-gray-600 mb-1">{label}</p>
+                  <div className="flex flex-wrap gap-1 mb-1">
+                    {(capturePolicyForm[key] as string[]).map((kw, i) => (
+                      <span key={i} className="inline-flex items-center gap-1 text-xs bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2 py-0.5">
+                        {kw}
+                        <button
+                          type="button"
+                          onClick={() => setCapturePolicyForm(s => ({ ...s, [key]: (s[key] as string[]).filter((_, j) => j !== i) }))}
+                          className="ml-0.5 text-indigo-400 hover:text-indigo-700"
+                        >×</button>
+                      </span>
+                    ))}
+                  </div>
+                  <div className="flex gap-1">
+                    <input
+                      type="text"
+                      placeholder={placeholder}
+                      value={keywordInputs[inputKey]}
+                      onChange={(e) => setKeywordInputs(s => ({ ...s, [inputKey]: e.target.value }))}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ',') {
+                          e.preventDefault()
+                          const val = keywordInputs[inputKey].trim().toLowerCase()
+                          if (val && !(capturePolicyForm[key] as string[]).includes(val)) {
+                            setCapturePolicyForm(s => ({ ...s, [key]: [...(s[key] as string[]), val] }))
+                          }
+                          setKeywordInputs(s => ({ ...s, [inputKey]: '' }))
+                        }
+                      }}
+                      className="flex-1 text-xs border rounded px-2 py-1"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const val = keywordInputs[inputKey].trim().toLowerCase()
+                        if (val && !(capturePolicyForm[key] as string[]).includes(val)) {
+                          setCapturePolicyForm(s => ({ ...s, [key]: [...(s[key] as string[]), val] }))
+                        }
+                        setKeywordInputs(s => ({ ...s, [inputKey]: '' }))
+                      }}
+                      className="text-xs px-2 py-1 bg-indigo-600 text-white rounded hover:bg-indigo-700"
+                    >Add</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Stats row */}
@@ -1012,14 +1082,36 @@ export default function Integrations() {
                         <p className="text-sm font-medium text-gray-900">{m.topic}</p>
                         <p className="text-xs text-gray-500">{new Date(m.start_time).toLocaleString()} · {m.duration} min</p>
                       </div>
-                      <a
-                        href={m.join_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 font-medium"
-                      >
-                        Join
-                      </a>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={async () => {
+                            setZoomBotJoiningUrl(m.join_url)
+                            try {
+                              await api.post('/api/v1/integrations/zoom/bot/join', {
+                                zoom_url: m.join_url,
+                                stay_duration_seconds: m.duration * 60,
+                              })
+                              showIntegrationToast('Bot launched — joining your Zoom meeting now')
+                            } catch (e: any) {
+                              showIntegrationToast(e?.response?.data?.detail || 'Failed to launch bot', true)
+                            } finally {
+                              setTimeout(() => setZoomBotJoiningUrl(null), 3000)
+                            }
+                          }}
+                          disabled={zoomBotJoiningUrl === m.join_url}
+                          className="text-xs px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded-lg hover:bg-indigo-100 font-medium disabled:opacity-50"
+                        >
+                          {zoomBotJoiningUrl === m.join_url ? 'Launching…' : '🤖 Bot Join'}
+                        </button>
+                        <a
+                          href={m.join_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-xs px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 font-medium"
+                        >
+                          Join
+                        </a>
+                      </div>
                     </div>
                   ))}
                 </div>

@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react'
 import { useQuery } from 'react-query'
-import { CheckCircle, Circle, Clock } from 'lucide-react'
+import { CheckCircle, Circle, Clock, Trash2 } from 'lucide-react'
 import { api } from '../lib/api'
 
 const ActionItems: React.FC = () => {
@@ -9,6 +9,8 @@ const ActionItems: React.FC = () => {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
   const [priorityFilter, setPriorityFilter] = useState('all')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [deleting, setDeleting] = useState(false)
   const [form, setForm] = useState({
     title: '',
     description: '',
@@ -46,6 +48,26 @@ const ActionItems: React.FC = () => {
     item.due_date && new Date(item.due_date) < now && item.status !== 'completed'
   )).length
 
+  const allVisibleIds = filteredItems.map((i: any) => i.id)
+  const allSelected = allVisibleIds.length > 0 && allVisibleIds.every((id: string) => selected.has(id))
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelected(new Set())
+    } else {
+      setSelected(new Set(allVisibleIds))
+    }
+  }
+
+  const toggleOne = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   const handleCreate = async (event: React.FormEvent) => {
     event.preventDefault()
     setError('')
@@ -78,13 +100,31 @@ const ActionItems: React.FC = () => {
     }
   }
 
-  const handleStatusChange = async (id: string, status: string) => {
+  const handleStatusChange = async (id: string, newStatus: string) => {
     try {
-      await api.patch(`/api/v1/action-items/${id}`, { status })
-      setBanner({ type: 'success', message: `Action item moved to ${status.replace('_', ' ')}.` })
+      await api.patch(`/api/v1/action-items/${id}`, { status: newStatus })
+      setBanner({ type: 'success', message: `Action item moved to ${newStatus.replace('_', ' ')}.` })
       refetch()
     } catch (err: any) {
       setBanner({ type: 'error', message: err?.response?.data?.detail || 'Failed to update status.' })
+    }
+  }
+
+  const handleDeleteSelected = async () => {
+    if (selected.size === 0) return
+    if (!window.confirm(`Delete ${selected.size} action item${selected.size > 1 ? 's' : ''}?`)) return
+    setDeleting(true)
+    try {
+      const params = new URLSearchParams()
+      selected.forEach((id) => params.append('ids', id))
+      await api.delete(`/api/v1/action-items/?${params.toString()}`)
+      setSelected(new Set())
+      setBanner({ type: 'success', message: `Deleted ${selected.size} action item${selected.size > 1 ? 's' : ''}.` })
+      refetch()
+    } catch (err: any) {
+      setBanner({ type: 'error', message: err?.response?.data?.detail || 'Failed to delete action items.' })
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -123,6 +163,16 @@ const ActionItems: React.FC = () => {
           <h1 className="text-3xl font-bold text-gray-900">Action Items</h1>
           <p className="mt-2 text-gray-600">Track and manage your meeting action items.</p>
         </div>
+        {selected.size > 0 && (
+          <button
+            onClick={handleDeleteSelected}
+            disabled={deleting}
+            className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50"
+          >
+            <Trash2 className="w-4 h-4" />
+            {deleting ? 'Deleting…' : `Delete ${selected.size} selected`}
+          </button>
+        )}
       </div>
 
       {banner && (
@@ -217,10 +267,29 @@ const ActionItems: React.FC = () => {
 
       {/* Action Items List */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-200">
+        {filteredItems.length > 0 && (
+          <div className="px-6 py-3 border-b border-gray-200 flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={toggleSelectAll}
+              className="w-4 h-4 rounded border-gray-300 text-primary-600"
+            />
+            <span className="text-sm text-gray-600">
+              {allSelected ? 'Deselect all' : `Select all ${filteredItems.length}`}
+            </span>
+          </div>
+        )}
         <div className="divide-y divide-gray-200">
           {filteredItems.length ? filteredItems.map((item: any) => (
-            <div key={item.id} className="p-6 hover:bg-gray-50 transition-colors">
+            <div key={item.id} className={`p-6 hover:bg-gray-50 transition-colors ${selected.has(item.id) ? 'bg-red-50' : ''}`}>
               <div className="flex items-start space-x-4">
+                <input
+                  type="checkbox"
+                  checked={selected.has(item.id)}
+                  onChange={() => toggleOne(item.id)}
+                  className="mt-1 w-4 h-4 rounded border-gray-300 text-primary-600"
+                />
                 {getStatusIcon(item.status)}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-start justify-between">

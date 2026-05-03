@@ -10,6 +10,7 @@ const Settings: React.FC = () => {
   })
 
   const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
 
   const [fullName, setFullName] = useState('')
   const [timezone, setTimezone] = useState('UTC')
@@ -17,6 +18,7 @@ const Settings: React.FC = () => {
   const [jobTitle, setJobTitle] = useState('')
   const [emailEnabled, setEmailEnabled] = useState(true)
   const [slackEnabled, setSlackEnabled] = useState(true)
+  const [autoOpenCalendar, setAutoOpenCalendar] = useState(false)
 
   React.useEffect(() => {
     if (!profile) return
@@ -26,6 +28,7 @@ const Settings: React.FC = () => {
     setJobTitle(profile.job_title || '')
     setEmailEnabled(profile.notification_settings?.email_enabled ?? true)
     setSlackEnabled(profile.notification_settings?.slack_enabled ?? true)
+    setAutoOpenCalendar(profile.preferences?.auto_open_calendar ?? false)
   }, [profile])
 
   const handleSave = async (event: React.FormEvent) => {
@@ -41,9 +44,15 @@ const Settings: React.FC = () => {
         email_enabled: emailEnabled,
         slack_enabled: slackEnabled,
       },
+      preferences: {
+        ...(profile?.preferences || {}),
+        auto_open_calendar: autoOpenCalendar,
+      },
     })
     await refetch()
     setSaving(false)
+    setSaved(true)
+    setTimeout(() => setSaved(false), 2500)
   }
 
   return (
@@ -71,7 +80,9 @@ const Settings: React.FC = () => {
           <input value={jobTitle} onChange={(e) => setJobTitle(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-lg" />
         </div>
 
+        {/* Notifications */}
         <div className="pt-2 border-t border-gray-200 space-y-2">
+          <p className="text-sm font-medium text-gray-700">Notifications</p>
           <label className="flex items-center gap-2 text-sm text-gray-700">
             <input type="checkbox" checked={emailEnabled} onChange={(e) => setEmailEnabled(e.target.checked)} />
             Email notifications
@@ -82,9 +93,31 @@ const Settings: React.FC = () => {
           </label>
         </div>
 
-        <button type="submit" disabled={saving} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-60">
-          {saving ? 'Saving...' : 'Save Changes'}
-        </button>
+        {/* Meeting creation behaviour */}
+        <div className="pt-2 border-t border-gray-200 space-y-2">
+          <p className="text-sm font-medium text-gray-700">Meeting Creation</p>
+          <label className="flex items-start gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={autoOpenCalendar}
+              onChange={(e) => setAutoOpenCalendar(e.target.checked)}
+            />
+            <span>
+              Auto-open in Google Calendar after creating a Google Meet meeting
+              <span className="block text-xs text-gray-500 mt-0.5">
+                Opens the calendar event in a new tab immediately after the meeting is created.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button type="submit" disabled={saving} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-60">
+            {saving ? 'Saving…' : 'Save Changes'}
+          </button>
+          {saved && <span className="text-sm text-green-600">Saved!</span>}
+        </div>
       </form>
     </div>
   )

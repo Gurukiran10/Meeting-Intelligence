@@ -29,6 +29,7 @@ Full pipeline per session
 12. Disable camera (data-is-muted=false → click)
 13. Click "Join now" / "Ask to join" with 4-strategy fallback
 14. Confirm in-meeting (polls for Leave-call button)
+14b. Send recording consent announcement in Meet chat
 15. Start in-page Playwright recording if ffmpeg unavailable
 16. Stay for configured duration
 17. Stop recording → save path to DB
@@ -73,9 +74,9 @@ DEFAULT_BOT_NAME     = "SyncMinds Bot"
 MAX_RETRIES          = 2
 
 PAGE_LOAD_TIMEOUT    = 35_000   # ms — Meet SPA needs more time than a static page
-PREJOIN_POLL_PER_ATTEMPT_S = 12  # s — DOM-poll window per attempt
-PREJOIN_MAX_RETRIES        = 3   # reload attempts when "can't join" is shown
-PREJOIN_BLOCKED_WAIT_S     = 5   # s — pause before page reload on "can't join"
+PREJOIN_POLL_PER_ATTEMPT_S = 8   # s — DOM-poll window per attempt
+PREJOIN_MAX_RETRIES        = 20  # reload attempts when "can't join" is shown (up to ~3 min)
+PREJOIN_BLOCKED_WAIT_S     = 7   # s — pause before page reload on "can't join"
 ELEMENT_TIMEOUT      = 8_000    # ms — per-selector wait when probing
 JOIN_ENABLED_TIMEOUT = 12_000   # ms — wait for join button to become enabled after name entry
 IN_MEETING_TIMEOUT   = 40_000   # ms — wait to confirm inside the meeting
@@ -249,11 +250,32 @@ def _db_upsert_meeting_sync(user_id: str, organization_id: str, meet_url: str, t
     from app.models.meeting import Meeting
     from sqlalchemy import select
 
-    external_id = meet_url.rstrip("/").split("/")[-1]
+    # Normalize URL: strip query params, trailing slashes
+    meet_url = meet_url.split("?")[0].split("#")[0].rstrip("/")
+    external_id = meet_url.split("/")[-1]
     now = datetime.utcnow()
 
     with SessionLocal() as db:
+        # First: look for any existing meeting (any platform) with the same URL — this
+        # handles meetings created through the app via Google Calendar integration.
         existing = db.execute(
+            select(Meeting).where(
+                Meeting.organizer_id == user_id,
+                Meeting.meeting_url == meet_url,
+                Meeting.deleted_at.is_(None),
+            )
+        ).scalar_one_or_none()
+
+        if existing:
+            # Mark it as in_progress so recording/transcription attaches here
+            existing.actual_start = now  # type: ignore
+            existing.status = "in_progress"  # type: ignore
+            existing.recording_consent = True  # type: ignore
+            db.commit()
+            return str(existing.id)
+
+        # Fallback: bot-initiated meeting (not pre-created in the app)
+        bot_existing = db.execute(
             select(Meeting).where(
                 Meeting.organizer_id == user_id,
                 Meeting.platform == "meet",
@@ -261,8 +283,8 @@ def _db_upsert_meeting_sync(user_id: str, organization_id: str, meet_url: str, t
             )
         ).scalar_one_or_none()
 
-        if existing:
-            return str(existing.id)
+        if bot_existing:
+            return str(bot_existing.id)
 
         meeting = Meeting(
             organization_id=organization_id,
@@ -618,15 +640,22 @@ async def _wait_for_prejoin_screen(page: Any, user_id: str) -> bool:
 
             if attempt < PREJOIN_MAX_RETRIES:
                 _bot_print(
-                    f"[BOT] Waiting {PREJOIN_BLOCKED_WAIT_S}s then reloading "
-                    f"(attempt {attempt + 1} coming up)…"
+                    f"[BOT] Waiting {PREJOIN_BLOCKED_WAIT_S}s for host to join, "
+                    f"then navigating fresh (attempt {attempt + 1} coming up)…"
                 )
                 await asyncio.sleep(PREJOIN_BLOCKED_WAIT_S)
+                # Navigate via about:blank first — clears Google's cached
+                # "can't join" response for this session before re-entering.
+                saved_url = page.url
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=35_000)
-                    _bot_print(f"[BOT] Page reloaded — URL={page.url}")
+                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=5_000)
+                except Exception:
+                    pass
+                try:
+                    await page.goto(saved_url, wait_until="domcontentloaded", timeout=35_000)
+                    _bot_print(f"[BOT] Fresh navigation done — URL={page.url}")
                 except Exception as exc:
-                    _bot_print(f"[BOT] Reload failed (non-fatal): {exc}")
+                    _bot_print(f"[BOT] Navigation failed (non-fatal): {exc}")
         else:
             # Timed out with no signal at all — log and try next attempt
             _bot_print(
@@ -957,8 +986,18 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
     _bot_print(f"[BOT] _click_join: 5 s stabilisation wait — user={user_id}")
     await page.wait_for_timeout(5_000)
 
-    for attempt in range(1, 6):
-        _bot_print(f"[BOT] ── Join attempt {attempt}/5 ──")
+    _MAX_ATTEMPTS = 15  # up to ~5 min waiting for host to let bot in
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        _bot_print(f"[BOT] ── Join attempt {attempt}/{_MAX_ATTEMPTS} ──")
+
+        # Check if we are already inside the meeting (e.g. joined on a prior
+        # attempt but the leave-call confirmation check was too fast)
+        try:
+            if await page.locator('[aria-label*="Leave call" i]').count() > 0:
+                _bot_print(f"[BOT] ✓ Already in meeting on attempt {attempt} — returning success")
+                return True
+        except Exception:
+            pass
 
         # Dismiss any overlay that blocks the join button
         await _dismiss_media_popup(page, user_id)
@@ -996,16 +1035,26 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
         if is_blocked_screen:
             _bot_print(
                 f"[BOT WARNING] Post-join 'can't join' screen detected "
-                f"on attempt {attempt}/5 — jsnames={page_jsnames & _CANT_JOIN_JSNAMES}"
+                f"on attempt {attempt}/{_MAX_ATTEMPTS} — jsnames={page_jsnames & _CANT_JOIN_JSNAMES}"
+            )
+            _bot_print(
+                "[BOT] Host may not be in the meeting yet. "
+                "Waiting 8 s then retrying…"
             )
             await _ss(f"cant_join_postclick_a{attempt}")
-            if attempt < 5:
-                await asyncio.sleep(3)
+            if attempt < _MAX_ATTEMPTS:
+                await asyncio.sleep(8)
+                # Navigate fresh (about:blank → meet URL) to clear cached block
+                saved_url = page.url
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=35_000)
-                    _bot_print(f"[BOT] Page reloaded for post-join retry — URL={page.url}")
+                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=5_000)
+                except Exception:
+                    pass
+                try:
+                    await page.goto(saved_url, wait_until="domcontentloaded", timeout=35_000)
+                    _bot_print(f"[BOT] Fresh navigation done for post-join retry — URL={page.url}")
                 except Exception as exc:
-                    _bot_print(f"[BOT] Reload failed (non-fatal): {exc}")
+                    _bot_print(f"[BOT] Navigation failed (non-fatal): {exc}")
                 prejoin_ok = await _wait_for_prejoin_screen(page, user_id)
                 if prejoin_ok:
                     _bot_print("[BOT] Pre-join screen restored after reload")
@@ -1020,7 +1069,6 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
                     await _wait_join_enabled(page, user_id)
                 else:
                     _bot_print("[BOT WARNING] Pre-join did not render after reload — continuing anyway")
-            await asyncio.sleep(3)
             continue
 
         # Screenshot BEFORE clicking
@@ -1103,13 +1151,70 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
         else:
             _bot_print(f"[BOT] No join button found on attempt {attempt}")
 
-        if attempt < 5:
+        if attempt < _MAX_ATTEMPTS:
             _bot_print(f"[BOT] Waiting 3 s before attempt {attempt + 1}")
             await asyncio.sleep(3)
 
     # ── All attempts exhausted ────────────────────────────────────────────────
-    _bot_print(f"[BOT ERROR] All 5 join attempts failed — user={user_id}")
+    _bot_print(f"[BOT ERROR] All {_MAX_ATTEMPTS} join attempts failed — user={user_id}")
     await _ss("join_failed_final")
+    return False
+
+
+
+async def _send_meet_chat_message(page: Any, user_id: str, message: str) -> bool:
+    """
+    Open the Google Meet in-call chat panel and send a message.
+    Returns True on success. Non-fatal — caller should catch exceptions.
+    """
+    CHAT_BTN_SELECTORS = [
+        '[aria-label="Chat with everyone"]',
+        '[data-tooltip="Chat with everyone"]',
+        'button[aria-label*="chat" i]',
+        '[jsname="A5il2e"]',
+    ]
+    CHAT_INPUT_SELECTORS = [
+        '[aria-label="Send a message to everyone"]',
+        'textarea[aria-label*="message" i]',
+        'div[contenteditable="true"][aria-label*="message" i]',
+        '[placeholder*="message" i]',
+    ]
+
+    # Open chat panel
+    chat_opened = False
+    for sel in CHAT_BTN_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=2_000):
+                await btn.click()
+                await asyncio.sleep(1)
+                chat_opened = True
+                _bot_print(f"[BOT] chat panel opened via {sel}")
+                break
+        except Exception:
+            continue
+
+    if not chat_opened:
+        _bot_print(f"[BOT] chat panel not found — skipping consent message")
+        return False
+
+    # Find input
+    for sel in CHAT_INPUT_SELECTORS:
+        try:
+            inp = page.locator(sel).first
+            if await inp.is_visible(timeout=2_000):
+                await inp.click()
+                await asyncio.sleep(0.3)
+                await inp.fill(message)
+                await asyncio.sleep(0.3)
+                await inp.press("Enter")
+                await asyncio.sleep(0.5)
+                _bot_print(f"[BOT] chat message sent via {sel}")
+                return True
+        except Exception:
+            continue
+
+    _bot_print(f"[BOT] chat input not found — could not send consent message")
     return False
 
 
@@ -1161,14 +1266,15 @@ async def _wait_in_meeting(page: Any, user_id: str) -> bool:
 _CHROMIUM_ARGS = [
     # ── Permission & media ───────────────────────────────────────────────────
     "--use-fake-ui-for-media-stream",       # auto-grant getUserMedia, no browser dialog
-    "--use-fake-device-for-media-stream",   # inject fake audio/video device
+    # NOTE: --use-fake-device-for-media-stream is intentionally omitted in headed mode
+    # so the real Mac mic/camera are used — fake devices are detectable by Google Meet.
+    # Added dynamically below only when running headless (Docker/CI).
     "--autoplay-policy=no-user-gesture-required",
     # ── Anti-detection ───────────────────────────────────────────────────────
     "--disable-blink-features=AutomationControlled",
     # ── Stability ────────────────────────────────────────────────────────────
     "--no-sandbox",
     "--disable-dev-shm-usage",              # prevents /dev/shm OOM in containers
-    "--disable-gpu",                        # headful still works without GPU
     "--disable-infobars",
     "--disable-extensions",
     "--disable-background-networking",
@@ -1310,11 +1416,15 @@ async def _run_session(
             async with async_playwright() as pw:
                 chromium_env = {**os.environ, **pulse_env}
 
+                chromium_args = _CHROMIUM_ARGS.copy()
+                if _HEADLESS:
+                    chromium_args.append("--use-fake-device-for-media-stream")
+
                 try:
                     browser = await pw.chromium.launch(
                         headless=_HEADLESS,
                         env=chromium_env,
-                        args=_CHROMIUM_ARGS,
+                        args=chromium_args,
                     )
                 except Exception as launch_exc:
                     _bot_print(f"[BOT ERROR] Browser launch failed: {launch_exc}")
@@ -1465,6 +1575,22 @@ async def _run_session(
                 await _screenshot(page, "06_in_meeting" if in_meeting else "06_waiting_room", user_id)
                 _bot_print(f"[BOT] Step 10 done: status={status} — staying {stay_duration_seconds}s")
 
+                # ── Step 10b: Send recording consent announcement in chat ──────
+                if in_meeting:
+                    _bot_print(f"[BOT] Step 10b: sending recording consent chat message")
+                    try:
+                        await asyncio.sleep(3)  # wait for chat panel to be available
+                        sent = await _send_meet_chat_message(
+                            page,
+                            user_id,
+                            "\U0001f916 SyncMinds Bot is recording this meeting for transcription "
+                            "and AI summarisation. If you do not consent, please ask the organiser "
+                            "to remove me from the call.",
+                        )
+                        _bot_print(f"[BOT] Step 10b done: consent message {'sent' if sent else 'skipped (chat unavailable)'}")
+                    except Exception as _chat_err:
+                        _bot_print(f"[BOT] Step 10b: chat error (non-fatal): {_chat_err}")
+
                 # ── Step 11: Start in-page recording if ffmpeg unavailable ────
                 if rec_session is None:
                     _bot_print(f"[BOT] Step 11: starting Playwright MediaRecorder (ffmpeg unavailable)")
@@ -1485,7 +1611,7 @@ async def _run_session(
                 poll_interval = 10
                 consecutive_gone = 0   # Leave button disappeared
                 alone_since: Optional[float] = None  # timestamp when bot became last participant
-                ALONE_GRACE = 30       # seconds to wait after going alone before leaving
+                ALONE_GRACE = 120      # seconds to wait after going alone before leaving
 
                 while elapsed < stay_duration_seconds:
                     await asyncio.sleep(poll_interval)
@@ -1528,20 +1654,20 @@ async def _run_session(
                                 for (const btn of btns) {
                                     const lbl = btn.getAttribute('aria-label') || '';
                                     if (/participant|people|everyone/i.test(lbl)) {
-                                        const m = lbl.match(/\((\d+)\)/);
+                                        const m = lbl.match(/\\((\d+)\\)/);
                                         if (m && parseInt(m[1]) <= 1) return true;
                                     }
                                 }
 
-                                // Count remote video/audio tiles (exclude self-preview)
-                                // Meet wraps each participant in [data-participant-id]
+                                // Count remote participant tiles — only trust this signal
+                                // if Meet has actually rendered tiles (headless mode renders 0
+                                // tiles even when others are present, so never fall back to
+                                // video element count which gives false "alone" positives).
                                 const tiles = document.querySelectorAll('[data-participant-id]');
-                                if (tiles.length === 0) {
-                                    // Fallback: look for at least one non-local video element
-                                    const vids = document.querySelectorAll('video');
-                                    return vids.length <= 1;
-                                }
-                                return tiles.length <= 1;
+                                if (tiles.length > 1) return false;   // multiple tiles = not alone
+                                if (tiles.length === 1) return true;  // only bot's own tile
+                                // tiles.length === 0 → headless: can't tell, assume not alone
+                                return false;
                             }
                         """)
                         if is_alone:
@@ -1598,16 +1724,27 @@ async def _run_session(
         except asyncio.CancelledError:
             logger.info("Bot: [user=%s] task cancelled", user_id)
             _active_bots[user_id]["status"] = "cancelled"
-            for cleanup in [
-                lambda: stop_recording(rec_session) if rec_session else None,
-                lambda: browser.close() if browser else None,
-            ]:
-                try:
-                    result = cleanup()
-                    if result:
-                        await result
-                except Exception:
-                    pass
+            # Try to save whatever audio was captured before the task was killed
+            try:
+                if rec_session:
+                    saved_path = await stop_recording(rec_session, page=page)
+                    if saved_path and saved_path.exists():
+                        path_str = str(saved_path.resolve())
+                        _bot_print(f"[BOT] Cancellation: recording saved → {path_str}")
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None, _db_save_recording_path_sync, meeting_id, path_str
+                        )
+                        process_meeting_recording_background(meeting_id, path_str)
+                    else:
+                        _bot_print(f"[BOT] Cancellation: no recording to save")
+            except Exception as _cancel_save_err:
+                _bot_print(f"[BOT] Cancellation: recording save failed — {_cancel_save_err}")
+            try:
+                if browser:
+                    await browser.close()
+            except Exception:
+                pass
             return
 
         except Exception as exc:
@@ -1750,6 +1887,7 @@ async def auto_join_upcoming_meets(
     stay_duration_seconds: int = DEFAULT_STAY_SECONDS,
     bot_display_name: str = DEFAULT_BOT_NAME,
     recordings_dir: str = "recordings",
+    allowed_event_ids: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
     Fetch upcoming Google Calendar events and start the bot for meetings
@@ -1759,7 +1897,8 @@ async def auto_join_upcoming_meets(
     from dateutil import parser as dtparser
 
     now_utc = datetime.now(timezone.utc)
-    time_min = now_utc.isoformat().replace("+00:00", "Z")
+    # Look back by lead_time_minutes so we don't miss meetings that started just before this check ran
+    time_min = (now_utc - timedelta(minutes=lead_time_minutes)).isoformat().replace("+00:00", "Z")
     time_max = (now_utc + timedelta(minutes=lead_time_minutes + 1)).isoformat().replace("+00:00", "Z")
 
     triggered: List[Dict[str, Any]] = []
@@ -1790,6 +1929,10 @@ async def auto_join_upcoming_meets(
                     meet_url = ep["uri"]
                     break
 
+        # Strip query params (?authuser=0 etc.) so URL matches what's stored in DB
+        if meet_url:
+            meet_url = meet_url.split("?")[0].split("#")[0].rstrip("/")
+
         if not meet_url or not is_valid_meet_url(meet_url):
             skipped.append(event.get("summary", "unknown"))
             continue
@@ -1804,7 +1947,13 @@ async def auto_join_upcoming_meets(
             start_dt = start_dt.replace(tzinfo=timezone.utc)
 
         delta_seconds = (start_dt - now_utc).total_seconds()
-        if -60 <= delta_seconds <= lead_time_minutes * 60:
+        if -(lead_time_minutes * 60) <= delta_seconds <= lead_time_minutes * 60:
+            # Skip if not in the allowed set (meeting was deleted or not created via app)
+            event_id = event.get("id", "")
+            if allowed_event_ids is not None and event_id not in allowed_event_ids:
+                skipped.append(event.get("summary", "unknown"))
+                logger.info("auto_join: skipping event %s (not in app DB / deleted)", event_id)
+                continue
             await join_google_meet(
                 meet_url=meet_url,
                 user_id=user_id,

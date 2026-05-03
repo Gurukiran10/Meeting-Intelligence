@@ -2,10 +2,11 @@
 Meetings API Endpoints
 """
 from typing import List, Optional, Dict, Any, Union
-from datetime import datetime
-from uuid import UUID
+from datetime import datetime, timedelta
+from uuid import UUID, uuid4
 import mimetypes
 import os
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status, UploadFile, File, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -21,6 +22,9 @@ from app.api.v1.endpoints.auth import get_current_user, require_org_member
 from app.tasks.meeting_processor import process_meeting_recording_background
 from app.services.absence_management import absence_management_service
 from app.services.pre_meeting_briefs import pre_meeting_brief_service
+from app.services.meeting_importance import score_meeting_for_user
+from app.services.attendee_optimization import analyze_participation
+from app.services.collaborative_prep import get_prep_summary
 
 router = APIRouter()
 
@@ -97,8 +101,8 @@ class MeetingCreate(BaseModel):
     @classmethod
     def validate_platform(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in {"zoom", "manual"}:
-            raise ValueError("Platform must be either 'zoom' or 'manual'")
+        if normalized not in {"zoom", "manual", "google_meet"}:
+            raise ValueError("Platform must be 'zoom', 'google_meet', or 'manual'")
         return normalized
 
     @field_validator("attendee_ids", mode="before")
@@ -152,6 +156,15 @@ class MeetingCreate(BaseModel):
         return value
 
 
+class ImportanceScore(BaseModel):
+    label: str
+    score: int
+    emoji: str
+    recommendation: str
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+
 class MeetingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -172,6 +185,9 @@ class MeetingResponse(BaseModel):
     agenda: Optional[Union[List[str], Dict[str, Any]]]
     tags: Optional[List[str]] = None
     created_at: datetime
+    importance: Optional[ImportanceScore] = None
+    meeting_url: Optional[str] = None
+    calendar_url: Optional[str] = None
 
 
 class InlineActionItemResponse(BaseModel):
@@ -266,13 +282,84 @@ class PreMeetingBriefResponse(BaseModel):
     importance: str
 
 
+async def _get_google_access_token_for_user(db: Session, user: User) -> Optional[str]:
+    """Return a valid Google access token for the user, refreshing if expired."""
+    from app.api.v1.endpoints.integrations import _get_google_access_token, _get_integration
+    try:
+        return await _get_google_access_token(db, user)
+    except Exception:
+        return None
+
+
+async def _create_google_calendar_event(
+    access_token: str,
+    title: str,
+    description: Optional[str],
+    start_dt: datetime,
+    end_dt: datetime,
+    attendee_emails: List[str],
+    calendar_id: str = "primary",
+) -> Dict[str, str]:
+    """Create a Google Calendar event with a Meet conference link.
+
+    Returns dict with keys: event_id, meet_url, calendar_url.
+    """
+    body = {
+        "summary": title,
+        "description": description or "",
+        "start": {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "timeZone": "UTC"},
+        "end": {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "timeZone": "UTC"},
+        "attendees": [{"email": e} for e in attendee_emails if e],
+        "conferenceData": {
+            "createRequest": {
+                "requestId": str(uuid4()),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"conferenceDataVersion": "1"},
+            json=body,
+        )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Google Calendar API error {resp.status_code}: {resp.text[:300]}",
+        )
+    data = resp.json()
+    return {
+        "event_id": data.get("id", ""),
+        "meet_url": data.get("hangoutLink", ""),
+        "calendar_url": data.get("htmlLink", ""),
+    }
+
+
+async def _delete_google_calendar_event(
+    access_token: str,
+    event_id: str,
+    calendar_id: str = "primary",
+) -> None:
+    """Delete a Google Calendar event by event_id. Silently ignores 404 (already deleted)."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.delete(
+            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if resp.status_code not in (200, 204, 404):
+        logger.warning("Google Calendar delete returned %s: %s", resp.status_code, resp.text[:200])
+
+
 @router.post("/", response_model=MeetingResponse, status_code=status.HTTP_201_CREATED)
 async def create_meeting(
     meeting_data: MeetingCreate,
     current_user: User = Depends(require_org_member),
     db: Session = Depends(get_db),
 ):
-    """Create new meeting"""
+    """Create new meeting. If platform is google_meet and user has Google connected,
+    creates a real Google Calendar event with a Meet conference link."""
     attendee_ids = _resolve_attendee_ids(db, meeting_data.attendee_ids)
 
     meeting = Meeting(
@@ -291,12 +378,95 @@ async def create_meeting(
         tags=meeting_data.tags,
         status="scheduled",
     )
-    
+
+    # If google_meet platform and user is connected (via auth OR integrations), create a real calendar event
+    from app.api.v1.endpoints.integrations import _get_integration as _gi
+    _google_int = _gi(current_user, "google")
+    _google_is_connected = current_user.google_connected or bool(_google_int and (_google_int.get("access_token") or _google_int.get("refresh_token")))
+    if meeting_data.platform == "google_meet" and _google_is_connected:
+        access_token = await _get_google_access_token_for_user(db, current_user)
+        if access_token:
+            try:
+                # Collect attendee emails for calendar invites
+                attendee_emails: List[str] = []
+                for uid in attendee_ids:
+                    u = db.execute(select(User).where(User.id == uid)).scalar_one_or_none()
+                    if u and u.email:
+                        attendee_emails.append(u.email)
+
+                from app.api.v1.endpoints.integrations import _get_integration
+                google_config = _get_integration(current_user, "google")
+                calendar_id = google_config.get("calendar_id", "primary") or "primary"
+
+                cal_event = await _create_google_calendar_event(
+                    access_token=access_token,
+                    title=meeting_data.title,
+                    description=meeting_data.description,
+                    start_dt=meeting_data.scheduled_start,
+                    end_dt=meeting_data.scheduled_end,
+                    attendee_emails=attendee_emails,
+                    calendar_id=calendar_id,
+                )
+                if cal_event["meet_url"]:
+                    meeting.meeting_url = cal_event["meet_url"]        # type: ignore[attr-defined]
+                if cal_event["event_id"]:
+                    meeting.external_id = cal_event["event_id"]        # type: ignore[attr-defined]
+                meeting.meeting_metadata = {                            # type: ignore[attr-defined]
+                    "calendar_url": cal_event["calendar_url"],
+                    "calendar_event_id": cal_event["event_id"],
+                }
+            except Exception as exc:
+                # Non-fatal: save meeting without calendar event
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Google Calendar event creation failed (meeting saved without link): %s", exc
+                )
+
+    # If zoom platform and user has Zoom connected, create a real Zoom meeting
+    if meeting_data.platform == "zoom":
+        try:
+            from app.api.v1.endpoints.integrations import _get_integration, _get_zoom_access_token
+            zoom_config = _get_integration(current_user, "zoom")
+            if zoom_config and zoom_config.get("account_id"):
+                zoom_token = await _get_zoom_access_token(db, current_user)
+                start_iso = meeting_data.scheduled_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+                duration_mins = max(1, int((meeting_data.scheduled_end - meeting_data.scheduled_start).total_seconds() / 60))
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    resp = await client.post(
+                        "https://api.zoom.us/v2/users/me/meetings",
+                        headers={"Authorization": f"Bearer {zoom_token}", "Content-Type": "application/json"},
+                        json={
+                            "topic": meeting_data.title,
+                            "type": 2,
+                            "start_time": start_iso,
+                            "duration": duration_mins,
+                            "agenda": meeting_data.description or "",
+                            "settings": {"join_before_host": True, "waiting_room": False},
+                        },
+                    )
+                if resp.status_code in (200, 201):
+                    zm = resp.json()
+                    meeting.meeting_url = zm.get("join_url", "")          # type: ignore[attr-defined]
+                    meeting.external_id = str(zm.get("id", ""))           # type: ignore[attr-defined]
+                    meeting.meeting_metadata = {"zoom_start_url": zm.get("start_url", "")}  # type: ignore[attr-defined]
+                else:
+                    import logging
+                    logging.getLogger(__name__).warning("Zoom meeting creation failed %s: %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Zoom meeting creation error (saved without link): %s", exc)
+
     db.add(meeting)
     db.commit()
     db.refresh(meeting)
-    
-    return meeting
+
+    # Attach calendar_url from metadata for the response
+    response = MeetingResponse.model_validate(meeting)
+    if meeting.meeting_metadata:
+        response.calendar_url = meeting.meeting_metadata.get("calendar_url")
+    if meeting.meeting_url:
+        response.meeting_url = meeting.meeting_url                        # type: ignore[attr-defined]
+    return response
 
 
 @router.get("/", response_model=List[MeetingResponse])
@@ -327,12 +497,29 @@ async def list_meetings(
     if status:
         query = query.where(Meeting.status == status)
     
-    query = query.order_by(desc(Meeting.scheduled_start)).offset(skip).limit(limit)
+    query = query.order_by(desc(Meeting.created_at)).offset(skip).limit(limit)
     
     result = db.execute(query)
     meetings = result.scalars().all()
-    
-    return meetings
+
+    # Attach importance scores (use cached value from meeting_metadata when available)
+    enriched = []
+    for m in meetings:
+        m_dict = {col.name: getattr(m, col.name) for col in Meeting.__table__.columns}
+        meta = dict(m.meeting_metadata or {})
+        cached = meta.get("importance", {}).get(str(current_user.id))
+        if not cached:
+            try:
+                cached = score_meeting_for_user(db, m, current_user)
+                meta.setdefault("importance", {})[str(current_user.id)] = cached
+                m.meeting_metadata = meta
+                db.commit()
+            except Exception:
+                cached = None
+        m_dict["importance"] = cached
+        enriched.append(m_dict)
+
+    return [MeetingResponse.model_validate(m) for m in enriched]
 
 
 @router.get("/{meeting_id}", response_model=MeetingDetail)
@@ -392,6 +579,19 @@ async def get_meeting(
     meeting_dict["mentions"] = meeting_mentions
     recording_path = meeting_dict.get("recording_path") or ""
     meeting_dict["has_recording"] = bool(recording_path and os.path.exists(recording_path))
+
+    # Attach importance score (cache in meeting_metadata)
+    meta = dict(meeting.meeting_metadata or {})
+    cached_importance = meta.get("importance", {}).get(str(current_user.id))
+    if not cached_importance:
+        try:
+            cached_importance = score_meeting_for_user(db, meeting, current_user)
+            meta.setdefault("importance", {})[str(current_user.id)] = cached_importance
+            meeting.meeting_metadata = meta
+            db.commit()
+        except Exception:
+            cached_importance = None
+    meeting_dict["importance"] = cached_importance
 
     return MeetingDetail.model_validate(meeting_dict)
 
@@ -542,9 +742,23 @@ async def delete_meeting(
             detail="Only organizer can delete meeting",
         )
     
+    # Delete the Google Calendar event if one was created
+    event_id = getattr(meeting, "external_id", None)
+    platform = getattr(meeting, "platform", None)
+    if event_id and platform == "google_meet":
+        try:
+            access_token = await _get_google_access_token_for_user(db, current_user)
+            if access_token:
+                from app.api.v1.endpoints.integrations import _get_integration
+                google_config = _get_integration(current_user, "google")
+                calendar_id = google_config.get("calendar_id", "primary") or "primary"
+                await _delete_google_calendar_event(access_token, event_id, calendar_id)
+        except Exception as exc:
+            logger.warning("Could not delete Google Calendar event %s: %s", event_id, exc)
+
     meeting.deleted_at = datetime.utcnow()  # type: ignore
     db.commit()
-    
+
     return None
 
 
@@ -583,6 +797,47 @@ async def get_pre_meeting_brief(
     return await pre_meeting_brief_service.generate_api_brief_for_user(db, meeting, current_user)
 
 
+@router.get("/{meeting_id}/importance", response_model=Dict[str, Any])
+async def get_meeting_importance(
+    meeting_id: UUID,
+    refresh: bool = False,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Return the importance / skip-recommendation score for this meeting for the current user."""
+    meeting = db.execute(select(Meeting).where(Meeting.id == meeting_id)).scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    meta = dict(meeting.meeting_metadata or {})
+    cached = meta.get("importance", {}).get(str(current_user.id))
+
+    if not cached or refresh:
+        cached = score_meeting_for_user(db, meeting, current_user)
+        meta.setdefault("importance", {})[str(current_user.id)] = cached
+        meeting.meeting_metadata = meta
+        db.commit()
+
+    return cached
+
+
+@router.get("/{meeting_id}/participation", response_model=Dict[str, Any])
+async def get_meeting_participation(
+    meeting_id: UUID,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Return attendee participation breakdown — who spoke, who was silent, effectiveness score."""
+    meeting = db.execute(select(Meeting).where(Meeting.id == meeting_id)).scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    return analyze_participation(db, meeting)
+
+
 @router.post("/{meeting_id}/catchup/send", response_model=Dict[str, Any])
 async def send_meeting_catchup(
     meeting_id: UUID,
@@ -599,6 +854,21 @@ async def send_meeting_catchup(
 
     success = await absence_management_service.send_catchup_to_user(db, meeting, current_user)
     return {"sent": success, "meeting_id": str(meeting_id), "user_id": str(getattr(current_user, "id", ""))}
+
+
+@router.get("/{meeting_id}/prep", response_model=Dict[str, Any])
+async def get_meeting_prep(
+    meeting_id: UUID,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Collaborative prep: agenda suggestions + attendee optimization for an upcoming meeting."""
+    meeting = db.execute(select(Meeting).where(Meeting.id == meeting_id)).scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    return get_prep_summary(db, str(meeting_id))
 
 
 @router.get("/{meeting_id}/absentees", response_model=List[Dict[str, Any]])

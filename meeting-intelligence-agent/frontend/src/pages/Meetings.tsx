@@ -1,8 +1,20 @@
 import React, { useEffect, useMemo, useState } from 'react'
+
+// API datetimes are UTC but come without 'Z' suffix — append it so JS treats them as UTC
+const toLocalDate = (dt: string) => new Date(dt.endsWith('Z') || dt.includes('+') ? dt : dt + 'Z')
 import { useQuery } from 'react-query'
-import { MessageSquareQuote, Plus, Search, Trash2, Users, X } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Check, Copy, ExternalLink, MessageSquareQuote, Plus, Search, Trash2, Users, X, AlertTriangle } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../lib/api'
+
+type ImportanceScore = {
+  label: 'critical' | 'important' | 'optional' | 'skip'
+  score: number
+  emoji: string
+  recommendation: string
+  reasons: string[]
+  warnings: string[]
+}
 
 type Meeting = {
   id: string
@@ -18,6 +30,8 @@ type Meeting = {
   attendee_ids?: string[]
   tags?: string[]
   agenda?: string[] | Record<string, unknown> | null
+  importance?: ImportanceScore | null
+  meeting_url?: string | null
 }
 
 type UserOption = {
@@ -31,12 +45,17 @@ type MeetingForm = {
   title: string
   description: string
   meeting_type: string
-  platform: 'manual' | 'zoom'
+  platform: 'manual' | 'zoom' | 'google_meet'
   scheduled_start: string
   scheduled_end: string
   agendaText: string
   tagsText: string
 }
+
+type IntegrationModalState = {
+  platform: 'zoom' | 'google_meet'
+  name: string
+} | null
 
 const emptyForm: MeetingForm = {
   title: '',
@@ -51,7 +70,27 @@ const emptyForm: MeetingForm = {
 
 const isLikelyEmail = (value: string) => /\S+@\S+\.\S+/.test(value)
 
+const IMPORTANCE_STYLES: Record<string, { bg: string; text: string }> = {
+  critical: { bg: 'bg-red-100', text: 'text-red-700' },
+  important: { bg: 'bg-orange-100', text: 'text-orange-700' },
+  optional: { bg: 'bg-yellow-100', text: 'text-yellow-700' },
+  skip: { bg: 'bg-gray-100', text: 'text-gray-500' },
+}
+
+const ImportanceBadge: React.FC<{ importance: ImportanceScore }> = ({ importance }) => {
+  const styles = IMPORTANCE_STYLES[importance.label] ?? IMPORTANCE_STYLES.optional
+  return (
+    <span
+      className={`px-2 py-1 rounded-full text-xs font-medium ${styles.bg} ${styles.text}`}
+      title={importance.recommendation}
+    >
+      {importance.emoji} {importance.label}
+    </span>
+  )
+}
+
 const Meetings: React.FC = () => {
+  const navigate = useNavigate()
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
   const [isCreating, setIsCreating] = useState(false)
@@ -60,6 +99,15 @@ const Meetings: React.FC = () => {
   const [form, setForm] = useState<MeetingForm>(emptyForm)
   const [attendeeQuery, setAttendeeQuery] = useState('')
   const [selectedAttendees, setSelectedAttendees] = useState<string[]>([])
+  const [integrationModal, setIntegrationModal] = useState<IntegrationModalState>(null)
+  const [createdLinks, setCreatedLinks] = useState<{ meetUrl?: string; calendarUrl?: string } | null>(null)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+
+  const copyMeetingUrl = (id: string, url: string) => {
+    navigator.clipboard.writeText(url)
+    setCopiedId(id)
+    setTimeout(() => setCopiedId(null), 2000)
+  }
 
   const { data: meetings, isLoading, isError, error, refetch } = useQuery<Meeting[]>('meetings', async () => {
     const response = await api.get('/api/v1/meetings/', { timeout: 15000 })
@@ -76,6 +124,11 @@ const Meetings: React.FC = () => {
     retry: 1,
     refetchOnWindowFocus: false,
   })
+
+  const { data: userProfile } = useQuery('me-profile', async () => {
+    const response = await api.get('/api/v1/users/me')
+    return response.data
+  }, { retry: 1, refetchOnWindowFocus: false })
 
   const { data: allMentions } = useQuery<{ meeting_id: string }[]>('all-mentions', async () => {
     const response = await api.get('/api/v1/mentions/', { timeout: 15000 })
@@ -159,6 +212,26 @@ const Meetings: React.FC = () => {
     return `${user.full_name} (${user.username || user.email})`
   }
 
+  const handlePlatformChange = async (value: string) => {
+    if (value === 'zoom' || value === 'google_meet') {
+      try {
+        const res = await api.get('/api/v1/integrations/')
+        const integrations: { id: string; connected: boolean }[] = res.data
+        const entry = integrations.find((i) => i.id === (value === 'google_meet' ? 'google' : 'zoom'))
+        if (!entry?.connected) {
+          setIntegrationModal({
+            platform: value,
+            name: value === 'google_meet' ? 'Google Meet' : 'Zoom',
+          })
+          return
+        }
+      } catch {
+        // if check fails, allow selection anyway
+      }
+    }
+    setForm((prev) => ({ ...prev, platform: value as MeetingForm['platform'] }))
+  }
+
   const handleCreate = async (event: React.FormEvent) => {
     event.preventDefault()
     setCreateError('')
@@ -187,7 +260,7 @@ const Meetings: React.FC = () => {
 
     try {
       setIsCreating(true)
-      await api.post('/api/v1/meetings/', {
+      const res = await api.post('/api/v1/meetings/', {
         title: form.title.trim(),
         description: form.description.trim(),
         meeting_type: form.meeting_type,
@@ -199,12 +272,36 @@ const Meetings: React.FC = () => {
           : selectedAttendees,
         agenda: parsedAgenda.length ? { topics: parsedAgenda } : null,
         tags: parsedTags,
-      }, { timeout: 15000 })
+      }, { timeout: 20000 })
+
+      const meetUrl: string | undefined = res.data?.meeting_url
+      const calendarUrl: string | undefined = res.data?.calendar_url
+      const submittedPlatform = form.platform
 
       setShowCreate(false)
       resetCreateForm()
-      setBanner({ type: 'success', message: 'Meeting created successfully.' })
       refetch()
+
+      if (meetUrl || calendarUrl) {
+        setCreatedLinks({ meetUrl, calendarUrl })
+        setBanner({ type: 'success', message: 'Meeting created — Google Calendar event is live.' })
+        // Auto-open calendar if the user has that preference on
+        if (calendarUrl && userProfile?.preferences?.auto_open_calendar) {
+          window.open(calendarUrl, '_blank', 'noopener,noreferrer')
+        }
+      } else if (submittedPlatform === 'google_meet') {
+        setBanner({
+          type: 'success',
+          message: 'Meeting saved. To get a Google Meet link, go to Integrations → disconnect and reconnect Google with calendar access.',
+        })
+      } else if (submittedPlatform === 'zoom') {
+        setBanner({
+          type: 'success',
+          message: 'Meeting saved. To get a Zoom link, connect Zoom in Integrations first.',
+        })
+      } else {
+        setBanner({ type: 'success', message: 'Meeting created successfully.' })
+      }
     } catch (err: any) {
       if (err?.code === 'ECONNABORTED') {
         setCreateError('Create request timed out. Please try again.')
@@ -258,6 +355,38 @@ const Meetings: React.FC = () => {
         </div>
       )}
 
+      {createdLinks && (
+        <div className="flex items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm">
+          <span className="text-blue-700 font-medium">Your meeting is ready:</span>
+          {createdLinks.meetUrl && (
+            <a
+              href={createdLinks.meetUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 px-3 py-1 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-xs font-medium"
+            >
+              {createdLinks.meetUrl.includes('zoom.us') ? 'Join Zoom Meeting' : 'Open in Google Meet'}
+            </a>
+          )}
+          {createdLinks.calendarUrl && (
+            <a
+              href={createdLinks.calendarUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 px-3 py-1 border border-blue-300 text-blue-700 rounded-md hover:bg-blue-100 text-xs font-medium"
+            >
+              View in Google Calendar
+            </a>
+          )}
+          <button
+            onClick={() => setCreatedLinks(null)}
+            className="ml-auto text-blue-400 hover:text-blue-600 text-xs"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {showCreate && (
         <form onSubmit={handleCreate} className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 grid grid-cols-1 md:grid-cols-2 gap-4">
           <input
@@ -269,11 +398,12 @@ const Meetings: React.FC = () => {
           />
           <select
             value={form.platform}
-            onChange={(e) => setForm((prev) => ({ ...prev, platform: e.target.value as 'manual' | 'zoom' }))}
+            onChange={(e) => handlePlatformChange(e.target.value)}
             className="px-3 py-2 border border-gray-300 rounded-lg"
           >
             <option value="manual">Manual Upload</option>
             <option value="zoom">Zoom</option>
+            <option value="google_meet">Google Meet</option>
           </select>
           <input
             placeholder="Description"
@@ -442,7 +572,7 @@ const Meetings: React.FC = () => {
                       <p className="mt-1 text-sm text-gray-500">{meeting.description}</p>
                     )}
                     <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-gray-500">
-                      <span>{new Date(meeting.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })}</span>
+                      <span>{toLocalDate(meeting.scheduled_start).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })}</span>
                       <span>{meeting.platform}</span>
                       <span className="flex items-center gap-1">
                         <Users className="w-3.5 h-3.5" />
@@ -456,6 +586,9 @@ const Meetings: React.FC = () => {
                       }`}>
                         {meeting.status}
                       </span>
+                      {meeting.importance && (
+                        <ImportanceBadge importance={meeting.importance} />
+                      )}
                       {(mentionCountByMeeting[meeting.id] ?? 0) > 0 && (
                         <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-blue-50 text-blue-600 text-xs font-medium">
                           <MessageSquareQuote className="w-3 h-3" />
@@ -482,6 +615,28 @@ const Meetings: React.FC = () => {
                         ))}
                       </div>
                     )}
+
+                    {meeting.meeting_url && (
+                      <div className="mt-3 flex items-center gap-2 rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-2">
+                        <span className="flex-1 text-xs font-mono text-blue-800 truncate">{meeting.meeting_url}</span>
+                        <button
+                          onClick={() => copyMeetingUrl(meeting.id, meeting.meeting_url!)}
+                          className="flex items-center gap-1 px-2 py-1 rounded border border-blue-200 bg-white text-xs text-blue-700 hover:bg-blue-50 shrink-0"
+                        >
+                          {copiedId === meeting.id ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
+                          {copiedId === meeting.id ? 'Copied!' : 'Copy'}
+                        </button>
+                        <a
+                          href={meeting.meeting_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-1 px-2 py-1 rounded bg-blue-600 text-white text-xs hover:bg-blue-700 shrink-0"
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          Join
+                        </a>
+                      </div>
+                    )}
                   </div>
                   <button
                     onClick={() => handleDelete(meeting.id)}
@@ -503,6 +658,40 @@ const Meetings: React.FC = () => {
           </div>
         )}
       </div>
+      {integrationModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded-xl shadow-xl p-6 max-w-sm w-full mx-4">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-yellow-100 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5 text-yellow-600" />
+              </div>
+              <h2 className="text-base font-semibold text-gray-900">
+                {integrationModal.name} not connected
+              </h2>
+            </div>
+            <p className="text-sm text-gray-600 mb-6">
+              You need to connect your {integrationModal.name} account first. Once connected, SyncMinds can automatically create and join meetings on your behalf.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setIntegrationModal(null)}
+                className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setIntegrationModal(null)
+                  navigate('/integrations')
+                }}
+                className="flex-1 px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700"
+              >
+                Go to Integrations
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -71,6 +71,46 @@ async def get_mention(
     if not mention:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mention not found")
     return mention
+
+
+@router.delete("/{mention_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_mention(
+    mention_id: UUID,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Delete a single mention"""
+    mention = db.execute(
+        select(Mention).where(
+            Mention.id == mention_id,
+            Mention.organization_id == current_user.organization_id,
+            Mention.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if not mention:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mention not found")
+    db.delete(mention)
+    db.commit()
+
+
+@router.delete("/", status_code=status.HTTP_200_OK)
+async def bulk_delete_mentions(
+    ids: List[UUID] = Query(...),
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """Bulk delete mentions by list of IDs"""
+    mentions = db.execute(
+        select(Mention).where(
+            Mention.id.in_(ids),
+            Mention.organization_id == current_user.organization_id,
+            Mention.user_id == current_user.id,
+        )
+    ).scalars().all()
+    for mention in mentions:
+        db.delete(mention)
+    db.commit()
+    return {"deleted": len(mentions)}
 
 
 @router.post("/{mention_id}/read", response_model=MentionResponse)

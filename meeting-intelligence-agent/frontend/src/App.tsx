@@ -13,6 +13,8 @@ import Team from './pages/Team'
 import Settings from './pages/Settings'
 import Login from './pages/Login'
 import AcceptInvite from './pages/AcceptInvite'
+import SearchPage from './pages/Search'
+import Absence from './pages/Absence'
 import Layout from './components/Layout'
 import './index.css'
 import { useQuery } from 'react-query'
@@ -84,6 +86,8 @@ function App() {
             <Route path="team" element={<Team />} />
             <Route path="integrations" element={<Integrations />} />
             <Route path="settings" element={<Settings />} />
+            <Route path="search" element={<SearchPage />} />
+            <Route path="absence" element={<Absence />} />
           </Route>
         </Routes>
       </Router>
