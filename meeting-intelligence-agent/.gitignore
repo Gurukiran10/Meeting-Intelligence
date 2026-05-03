@@ -72,3 +72,7 @@ yarn-error.log*
 
 # Docker
 docker-compose.override.yml
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
