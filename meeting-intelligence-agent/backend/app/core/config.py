@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_MODEL: str = "claude-3-opus-20240229"
+
+    # Gemini (Google AI — free tier available, OpenAI-compatible)
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     
     # Whisper
     WHISPER_MODEL: str = "large-v3"
@@ -84,6 +89,7 @@ class Settings(BaseSettings):
     ZOOM_CLIENT_ID: str = ""
     ZOOM_CLIENT_SECRET: str = ""
     ZOOM_BOT_JWT: str = ""
+    ZOOM_WEBHOOK_SECRET: str = ""   # From Zoom Marketplace → Feature → Webhooks → Secret Token
     
     # Slack
     SLACK_CLIENT_ID: str = ""

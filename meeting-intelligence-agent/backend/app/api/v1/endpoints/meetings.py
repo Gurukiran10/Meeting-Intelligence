@@ -897,3 +897,175 @@ async def get_meeting_absentees(
         }
         for u in absentees
     ]
+
+
+@router.get("/{meeting_id}/bot-status")
+async def get_bot_status(
+    meeting_id: UUID,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the live bot session state for a meeting.
+    Combines Redis live state (if available) with the DB meeting status
+    so the frontend always gets a consistent answer.
+
+    Status values:
+      pending           — scheduled, bot not yet triggered
+      launching         — Chromium starting up
+      navigating        — loading meet URL
+      pre_join          — on pre-join screen
+      joining           — clicking join button
+      waiting_admission — in waiting room
+      in_meeting        — confirmed inside
+      waiting_for_host  — joined but alone, retry scheduled
+      recording         — actively recording
+      stopping          — stopping recording
+      completed         — recording saved, processing queued
+      failed            — all retries exhausted
+      host_absent       — max retries reached, host never showed
+      bot_rejected      — host denied admission
+      cancelled         — manually stopped
+    """
+    meeting = db.execute(
+        select(Meeting).where(Meeting.id == meeting_id)
+    ).scalar_one_or_none()
+
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    from app.services.bot_state import get_full_state, BotStatus
+
+    full_state = await get_full_state(str(meeting_id))
+
+    # Fall back to in-memory state for bots still running in FastAPI process
+    if full_state["status"] == "unknown":
+        from app.services.meet_bot import get_bot_status as _get_mem_status
+        mem = _get_mem_status(str(meeting.organizer_id)) or {}
+        if mem.get("status"):
+            full_state["status"]  = mem["status"]
+            full_state["message"] = BotStatus.message(mem["status"])
+
+    return {
+        "meeting_id":       str(meeting_id),
+        "db_status":        meeting.status,
+        # Canonical fields — always present
+        "bot_status":       full_state["status"],
+        "message":          full_state["message"],
+        "attempt":          full_state["attempt"],
+        "max_attempts":     full_state["max_attempts"],
+        "next_retry_at":    full_state["next_retry_at"],
+        "rejection_reason": full_state["rejection_reason"],
+        "last_error":       full_state["last_error"],
+        "meet_url":         full_state.get("meet_url") or str(meeting.meeting_url or ""),
+        "platform":         full_state.get("platform") or str(meeting.platform or ""),
+        "session_elapsed_s": full_state["session_elapsed_s"],
+        "created_at":       full_state["created_at"],
+        "updated_at":       full_state["updated_at"],
+    }
+
+
+@router.post("/{meeting_id}/trigger-bot")
+async def trigger_bot(
+    meeting_id: UUID,
+    current_user: User = Depends(require_org_member),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually trigger the bot for a specific meeting.
+    Uses the Celery task when available, falls back to in-process asyncio.
+    Bot dedup is enforced via Redis lock — safe to call multiple times.
+    """
+    meeting = db.execute(
+        select(Meeting).where(Meeting.id == meeting_id)
+    ).scalar_one_or_none()
+
+    if not meeting:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+
+    if not _can_access_meeting(current_user, meeting):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    if not meeting.meeting_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Meeting has no URL")
+
+    if meeting.status in ("completed", "transcribing", "analyzing"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Meeting already {meeting.status}",
+        )
+
+    from app.core.config import settings
+    from app.services.bot_state import acquire_lock, get_bot_state, BotStatus
+
+    mid_str  = str(meeting_id)
+    url      = str(meeting.meeting_url)
+    platform = str(meeting.platform or "google_meet")
+    uid      = str(meeting.organizer_id)
+    org_id   = str(meeting.organization_id)
+
+    # Check if bot is already running
+    state = await get_bot_state(mid_str)
+    active_statuses = {
+        BotStatus.LAUNCHING, BotStatus.NAVIGATING, BotStatus.PRE_JOIN,
+        BotStatus.JOINING, BotStatus.WAITING_ADMISSION, BotStatus.IN_MEETING,
+        BotStatus.RECORDING, BotStatus.STOPPING,
+    }
+    if state and state.get("status") in active_statuses:
+        return {
+            "queued":  False,
+            "message": f"Bot already active (status={state['status']})",
+            "status":  state["status"],
+        }
+
+    # Try Celery first
+    try:
+        from app.tasks.auto_join import run_bot_session_task
+        run_bot_session_task.apply_async(
+            kwargs={
+                "meeting_id":          mid_str,
+                "meet_url":            url,
+                "user_id":             uid,
+                "organization_id":     org_id,
+                "platform":            platform,
+                "bot_display_name":    settings.MEET_BOT_DISPLAY_NAME,
+                "stay_duration_seconds": settings.MEET_BOT_STAY_DURATION_SECONDS,
+                "recordings_dir":      settings.RECORDINGS_DIR,
+                "attempt":             1,
+            },
+            queue="bots",
+        )
+        return {"queued": True, "method": "celery", "meeting_id": mid_str}
+
+    except Exception as celery_err:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Celery unavailable, falling back to in-process bot: %s", celery_err
+        )
+
+    # Fallback: in-process asyncio (existing behaviour)
+    if platform == "zoom":
+        from app.services.zoom_bot import join_zoom_meeting
+        import asyncio
+        asyncio.create_task(join_zoom_meeting(
+            zoom_url=url, user_id=uid, organization_id=org_id,
+            meeting_id=mid_str,
+            bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
+            stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
+            recordings_dir=settings.RECORDINGS_DIR,
+        ))
+    else:
+        from app.services.meet_bot import join_google_meet
+        import asyncio
+        asyncio.create_task(join_google_meet(
+            meet_url=url, user_id=uid, organization_id=org_id,
+            meeting_id=mid_str,
+            bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
+            stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
+            recordings_dir=settings.RECORDINGS_DIR,
+        ))
+
+    return {"queued": True, "method": "in_process", "meeting_id": mid_str}

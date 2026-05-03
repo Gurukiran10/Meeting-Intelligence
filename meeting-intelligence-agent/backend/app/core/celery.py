@@ -13,6 +13,8 @@ celery_app = Celery(
         "app.tasks.action_item_reminders",
         "app.tasks.calendar_auto_join",
         "app.tasks.pre_meeting_brief_task",
+        "app.tasks.auto_join",
+        "app.tasks.cleanup",
     ],
 )
 
@@ -25,23 +27,47 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
-    task_time_limit=3600,  # 1 hour
-    task_soft_time_limit=3300,  # 55 minutes
+    task_time_limit=3600,
+    task_soft_time_limit=3300,
+
+    # Two queues: normal tasks vs. bot sessions.
+    # Bot sessions are long-lived (up to 2h) so they get their own worker pool.
+    # Start the bot worker with: celery -A app.core.celery:celery_app worker -Q bots -c 4
+    task_routes={
+        "run_bot_session":       {"queue": "bots"},
+        "poll_db_and_auto_join": {"queue": "celery"},  # lightweight scanner
+    },
+
     beat_schedule={
-        # Poll Google Calendar every 5 minutes and auto-join upcoming Meet sessions
+        # DB-based auto-join scanner (no Google Calendar needed)
+        "poll-db-auto-join": {
+            "task": "poll_db_and_auto_join",
+            "schedule": settings.MEET_BOT_LEAD_TIME_MINUTES * 60,
+        },
+        # Google Calendar-based auto-join (existing, kept for backward compat)
         "poll-calendar-auto-join": {
             "task": "poll_calendar_and_auto_join",
-            "schedule": 300.0,  # seconds
+            "schedule": 300.0,
         },
-        # Send pre-meeting briefs to attendees 30 minutes before each meeting
+        # Pre-meeting briefs
         "send-pre-meeting-briefs": {
             "task": "send_pre_meeting_briefs",
-            "schedule": 300.0,  # every 5 minutes
+            "schedule": 300.0,
         },
-        # Check action item due dates every hour
+        # Action item reminders
         "send-action-item-reminders": {
             "task": "send_action_item_reminders",
-            "schedule": crontab(minute=0),  # top of every hour
+            "schedule": crontab(minute=0),
+        },
+        # Stuck meeting cleanup — every 5 minutes
+        "cleanup-stuck-meetings": {
+            "task": "cleanup_stuck_meetings",
+            "schedule": 300.0,
+        },
+        # Google Calendar webhook renewal — every 6 hours
+        "renew-google-webhooks": {
+            "task": "renew_google_webhooks",
+            "schedule": crontab(minute=0, hour="*/6"),
         },
     },
 )

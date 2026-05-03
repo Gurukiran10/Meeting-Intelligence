@@ -340,6 +340,24 @@ def _db_mark_failed_sync(meeting_id: str, error: str) -> None:
             db.commit()
 
 
+def _db_mark_waiting_for_host_sync(meeting_id: str) -> None:
+    """Bot joined but was alone — host hasn't started. Reset to retriable state."""
+    import uuid
+    from app.core.database import SessionLocal
+    from app.models.meeting import Meeting
+
+    with SessionLocal() as db:
+        meeting = db.get(Meeting, uuid.UUID(meeting_id))
+        if meeting and meeting.status not in ("completed", "transcribing", "analyzing"):
+            meeting.status = "waiting_for_host"
+            meeting.transcription_status = "pending"
+            meeting.meeting_metadata = {
+                **(meeting.meeting_metadata or {}),
+                "waiting_for_host_at": datetime.utcnow().isoformat(),
+            }
+            db.commit()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Low-level Playwright helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1605,6 +1623,58 @@ async def _run_session(
                     else:
                         _bot_print(f"[BOT WARNING] Step 11: no recording available for this session")
 
+                # ── Step 11b: Build attendee context + start live pipeline ──────
+                live_pipeline = None
+                if in_meeting:
+                    try:
+                        from app.services.streaming_transcription import (
+                            LivePipeline,
+                            register_pipeline,
+                        )
+                        from app.services.user_context import build_attendee_map_sync
+
+                        # Fetch attendees from DB in background thread
+                        loop = asyncio.get_event_loop()
+                        attendee_map = await loop.run_in_executor(
+                            None, build_attendee_map_sync, meeting_id, organization_id
+                        )
+                        attendee_names = attendee_map.all_names()
+
+                        # Fetch session owner's display name for priority=critical
+                        def _get_user_name(uid: str) -> str:
+                            try:
+                                from app.core.database import SessionLocal
+                                from app.models.user import User
+                                _db = SessionLocal()
+                                try:
+                                    u = _db.query(User).filter(User.id == uid).first()
+                                    return u.full_name or u.username if u else ""
+                                finally:
+                                    _db.close()
+                            except Exception:
+                                return ""
+
+                        current_user_name = await loop.run_in_executor(None, _get_user_name, user_id)
+
+                        live_pipeline = LivePipeline(
+                            meeting_id=meeting_id,
+                            page=page,
+                            attendee_names=attendee_names,
+                            attendee_map=attendee_map,
+                            current_user_id=user_id,
+                            current_user_name=current_user_name,
+                            organization_id=organization_id,
+                        )
+                        register_pipeline(live_pipeline)
+                        live_pipeline.start()
+                        _bot_print(
+                            f"[BOT] Step 11b: LivePipeline started  meeting={meeting_id}"
+                            f"  attendees={len(attendee_names)}  owner={current_user_name!r}"
+                        )
+                    except Exception as _lp_err:
+                        _bot_print(f"[BOT WARNING] Step 11b: LivePipeline failed to start (non-fatal): {_lp_err}")
+                        live_pipeline = None
+
                 # ── Step 12: Stay in meeting (early exit when everyone leaves) ───
                 _bot_print(f"[BOT] Step 12: staying in meeting for up to {stay_duration_seconds}s")
                 elapsed = 0
@@ -1686,13 +1756,52 @@ async def _run_session(
 
                 _bot_print(f"[BOT] Step 12 done: stayed {elapsed}s")
 
+                # ── Step 12b: Stop live transcription pipeline ────────────────
+                if live_pipeline is not None:
+                    try:
+                        from app.services.streaming_transcription import unregister_pipeline
+                        await live_pipeline.stop()
+                        unregister_pipeline(meeting_id)
+                        _bot_print(f"[BOT] Step 12b: LivePipeline stopped  meeting={meeting_id}")
+                    except Exception as _lp_stop_err:
+                        _bot_print(f"[BOT WARNING] Step 12b: LivePipeline stop error (non-fatal): {_lp_stop_err}")
+                    live_pipeline = None
+
+                # Was the bot alone for the entire session (host never joined)?
+                # alone_since is set when the bot first detected it was alone.
+                # If alone_since == 0 (set from the start) or set right after joining,
+                # it means the host simply wasn't there.
+                alone_whole_time = (
+                    alone_since is not None
+                    and (elapsed - alone_since) >= ALONE_GRACE
+                    and alone_since < (ALONE_GRACE + poll_interval * 2)
+                )
+                _active_bots[user_id]["alone_whole_time"] = alone_whole_time
+
                 # ── Step 13: Stop recording ───────────────────────────────────
                 _bot_print(f"[BOT] Step 13: stopping recording")
                 _active_bots[user_id]["status"] = "stopping_recording"
                 recording_path = await stop_recording(rec_session, page=page)
                 rec_session = None
 
-                if recording_path and recording_path.exists():
+                if alone_whole_time:
+                    # Host never joined — discard the silent recording, reset meeting
+                    # so the auto-join scheduler can retry.
+                    _bot_print(
+                        f"[BOT] Step 13: host never joined — discarding silent recording, "
+                        f"resetting meeting to waiting_for_host  meeting={meeting_id}"
+                    )
+                    if recording_path and recording_path.exists():
+                        try:
+                            recording_path.unlink()
+                        except Exception:
+                            pass
+                    _active_bots[user_id]["status"] = "waiting_for_host"
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, _db_mark_waiting_for_host_sync, meeting_id
+                    )
+                elif recording_path and recording_path.exists():
                     path_str = str(recording_path.resolve())
                     _active_bots[user_id]["recording_path"] = path_str
                     _bot_print(f"[BOT] Step 13 done: recording saved → {path_str}")
@@ -1724,6 +1833,14 @@ async def _run_session(
         except asyncio.CancelledError:
             logger.info("Bot: [user=%s] task cancelled", user_id)
             _active_bots[user_id]["status"] = "cancelled"
+            # Stop live pipeline if running
+            try:
+                if live_pipeline is not None:
+                    from app.services.streaming_transcription import unregister_pipeline
+                    await live_pipeline.stop()
+                    unregister_pipeline(meeting_id)
+            except Exception:
+                pass
             # Try to save whatever audio was captured before the task was killed
             try:
                 if rec_session:

@@ -95,7 +95,22 @@ async def _get_valid_google_token(user: User, db) -> str | None:
 
 
 async def _run_for_all_users() -> list[dict]:
-    from app.services.meet_bot import auto_join_upcoming_meets
+    """Fetch upcoming calendar events and dispatch bot sessions via Celery bots queue.
+
+    Previous implementation called join_google_meet() which spawned the bot
+    as an asyncio.create_task inside this worker.  When asyncio.run() finished,
+    the event loop closed and the bot was silently killed mid-session.
+
+    Now we:
+      1. Fetch calendar events to find meetings starting soon.
+      2. Upsert a Meeting record in the DB (so the meeting exists).
+      3. Dispatch run_bot_session_task.apply_async(queue="bots") — same as
+         poll_db_and_auto_join, ensuring the bot runs on the dedicated worker.
+    """
+    from app.services.meet_bot import is_valid_meet_url
+    from app.tasks.auto_join import run_bot_session_task
+    from app.models.meeting import Meeting
+    from dateutil import parser as dtparser
 
     results = []
 
@@ -123,21 +138,121 @@ async def _run_for_all_users() -> list[dict]:
                     logger.debug("auto_join: no valid token for user %s — skipping", user_obj.id)
                     continue
 
-                result = await auto_join_upcoming_meets(
-                    user_id=str(user_obj.id),
-                    organization_id=str(user_obj.organization_id),
-                    access_token=access_token,
-                    lead_time_minutes=2,
-                )
+                user_id = str(user_obj.id)
+                org_id = str(user_obj.organization_id)
 
-                if result.get("triggered", 0) > 0:
-                    logger.info(
-                        "auto_join: triggered %d bot(s) for user %s: %s",
-                        result["triggered"],
-                        user_obj.id,
-                        result.get("meetings"),
+                # ── Fetch calendar events ────────────────────────────────
+                now_utc = datetime.now(timezone.utc)
+                lead_time = 2  # minutes
+                time_min = (now_utc - timedelta(minutes=lead_time)).isoformat().replace("+00:00", "Z")
+                time_max = (now_utc + timedelta(minutes=lead_time + 1)).isoformat().replace("+00:00", "Z")
+
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(
+                        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        params={
+                            "singleEvents": "true",
+                            "orderBy": "startTime",
+                            "maxResults": 20,
+                            "timeMin": time_min,
+                            "timeMax": time_max,
+                        },
                     )
-                results.append({"user_id": str(user_obj.id), **result})
+
+                if resp.status_code != 200:
+                    logger.warning("auto_join: calendar fetch failed for user %s: %s", user_id, resp.text[:200])
+                    results.append({"user_id": user_id, "error": resp.text[:200]})
+                    continue
+
+                triggered = 0
+                for event in resp.json().get("items", []):
+                    meet_url = event.get("hangoutLink")
+                    if not meet_url:
+                        for ep in (event.get("conferenceData") or {}).get("entryPoints", []):
+                            if ep.get("entryPointType") == "video" and "meet.google.com" in str(ep.get("uri", "")):
+                                meet_url = ep["uri"]
+                                break
+                    if meet_url:
+                        meet_url = meet_url.split("?")[0].split("#")[0].rstrip("/")
+
+                    if not meet_url or not is_valid_meet_url(meet_url):
+                        continue
+
+                    start_str = (event.get("start") or {}).get("dateTime")
+                    if not start_str:
+                        continue
+
+                    start_dt = dtparser.parse(start_str)
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=timezone.utc)
+
+                    delta_seconds = (start_dt - now_utc).total_seconds()
+                    if not (-(lead_time * 60) <= delta_seconds <= lead_time * 60):
+                        continue
+
+                    # ── Ensure a Meeting record exists in DB ──────────────
+                    meeting_id = None
+                    with SessionLocal() as mdb:
+                        existing = mdb.execute(
+                            select(Meeting).where(
+                                Meeting.meeting_url == meet_url,
+                                Meeting.deleted_at.is_(None),
+                            )
+                        ).scalar_one_or_none()
+
+                        if existing:
+                            meeting_id = str(existing.id)
+                            # Only dispatch if it's in a joinable state
+                            if existing.status not in ("scheduled", "waiting_for_host"):
+                                logger.debug(
+                                    "auto_join: skipping %s — status=%s",
+                                    meeting_id, existing.status,
+                                )
+                                continue
+                        else:
+                            # Create a new meeting record
+                            new_meeting = Meeting(
+                                organization_id=org_id,
+                                title=event.get("summary", "Google Meet"),
+                                platform="google_meet",
+                                meeting_url=meet_url,
+                                scheduled_start=start_dt.replace(tzinfo=None),
+                                scheduled_end=(start_dt + timedelta(hours=1)).replace(tzinfo=None),
+                                organizer_id=user_id,
+                                created_by=user_id,
+                                status="scheduled",
+                                transcription_status="pending",
+                            )
+                            mdb.add(new_meeting)
+                            mdb.commit()
+                            mdb.refresh(new_meeting)
+                            meeting_id = str(new_meeting.id)
+
+                    # ── Dispatch to bots queue ────────────────────────────
+                    logger.info(
+                        "auto_join: dispatching bot via Celery  meeting=%s  url=%s",
+                        meeting_id, meet_url,
+                    )
+                    run_bot_session_task.apply_async(
+                        kwargs={
+                            "meeting_id": meeting_id,
+                            "meet_url": meet_url,
+                            "user_id": user_id,
+                            "organization_id": org_id,
+                            "platform": "google_meet",
+                            "bot_display_name": getattr(settings, "MEET_BOT_DISPLAY_NAME", "SyncMinds Bot"),
+                            "stay_duration_seconds": getattr(settings, "MEET_BOT_STAY_DURATION_SECONDS", 600),
+                            "recordings_dir": getattr(settings, "RECORDINGS_DIR", "recordings"),
+                            "attempt": 1,
+                        },
+                        queue="bots",
+                    )
+                    triggered += 1
+
+                if triggered > 0:
+                    logger.info("auto_join: triggered %d bot(s) for user %s", triggered, user_id)
+                results.append({"user_id": user_id, "triggered": triggered})
 
             except Exception as exc:
                 logger.exception("auto_join: error processing user %s: %s", user_obj.id, exc)

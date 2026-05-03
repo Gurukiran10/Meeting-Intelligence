@@ -46,7 +46,16 @@ class Meeting(Base):
     
     # Processing Status
     status = Column(String(50), default="scheduled", index=True)
-    # scheduled, in_progress, completed, transcribing, analyzing, failed
+    # scheduled        — created, bot not yet triggered
+    # joining          — bot is actively attempting to join
+    # waiting_for_host — bot joined but was alone; retry scheduled
+    # host_absent      — max retries reached, host never showed
+    # in_progress      — bot confirmed inside meeting, recording active
+    # transcribing     — recording saved, transcription running
+    # analyzing        — transcription done, NLP running
+    # completed        — all processing done
+    # failed           — bot or processing failed permanently
+    # bot_rejected     — host denied bot admission
     transcription_status = Column(String(50), default="pending")
     analysis_status = Column(String(50), default="pending")
     

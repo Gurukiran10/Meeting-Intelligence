@@ -82,13 +82,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     async def _auto_join_loop():
         """
-        Every MEET_BOT_LEAD_TIME_MINUTES minutes, check all Google-connected users
-        for meetings starting soon and dispatch the Playwright bot automatically.
+        DB-based auto-join: every MEET_BOT_LEAD_TIME_MINUTES, scan the meetings
+        table for upcoming sessions and dispatch the bot.
+
+        Uses Redis dedup locks — safe to run alongside the Celery Beat scheduler.
+        Whichever fires first acquires the lock; the other skips silently.
+        Falls back to in-process asyncio when Celery is unavailable (dev mode).
         """
-        from app.services.meet_bot import auto_join_upcoming_meets
-        from app.api.v1.endpoints.integrations import _get_google_access_token
         from app.core.database import SessionLocal
+        from app.models.meeting import Meeting as MeetingModel
+        from app.models.user import User as UserModel
+        from app.services.bot_state import acquire_lock, get_bot_state, BotStatus
         from sqlalchemy import select
+        from datetime import timedelta
 
         interval_seconds = max(settings.MEET_BOT_LEAD_TIME_MINUTES, 1) * 60
 
@@ -97,48 +103,88 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             if not settings.MEET_BOT_AUTO_JOIN_ENABLED:
                 continue
             try:
+                now = asyncio.get_event_loop().time()
+                from datetime import datetime, timezone
+                now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+                window_start = now_dt - timedelta(minutes=settings.MEET_BOT_LEAD_TIME_MINUTES)
+                window_end   = now_dt + timedelta(minutes=settings.MEET_BOT_LEAD_TIME_MINUTES + 1)
+
                 with SessionLocal() as db:
-                    from app.models.user import User as UserModel
-                    users = db.execute(
-                        select(UserModel).where(UserModel.google_connected.is_(True))
+                    upcoming = db.execute(
+                        select(MeetingModel).where(
+                            MeetingModel.deleted_at.is_(None),
+                            MeetingModel.status.in_(["scheduled", "waiting_for_host"]),
+                            MeetingModel.meeting_url.isnot(None),
+                            MeetingModel.scheduled_start >= window_start,
+                            MeetingModel.scheduled_start <= window_end,
+                        )
                     ).scalars().all()
 
-                for user in users:
+                for meeting in upcoming:
+                    mid      = str(meeting.id)
+                    platform = str(meeting.platform or "google_meet")
+                    url      = str(meeting.meeting_url)
+                    uid      = str(meeting.organizer_id)
+                    org_id   = str(meeting.organization_id or "")
+
+                    # Skip if bot already active (Redis or in-memory state)
+                    state = await get_bot_state(mid)
+                    if state and state.get("status") not in (
+                        None, "", BotStatus.PENDING, BotStatus.COMPLETED,
+                        BotStatus.FAILED, BotStatus.HOST_ABSENT,
+                        BotStatus.BOT_REJECTED, BotStatus.WAITING_FOR_HOST,
+                    ):
+                        logger.debug("[AutoJoin] bot already active  meeting=%s  status=%s",
+                                     mid, state.get("status"))
+                        continue
+
+                    # Try Celery first; fall back to in-process asyncio
                     try:
-                        with SessionLocal() as db:
-                            db_user = db.get(UserModel, user.id)
-                            if not db_user:
-                                continue
-                            access_token = await _get_google_access_token(db=db, current_user=db_user)
-
-                            # Only join meetings that exist (not deleted) in the app DB
-                            from app.models.meeting import Meeting as MeetingModel
-                            active_meetings = db.execute(
-                                select(MeetingModel).where(
-                                    MeetingModel.organizer_id == user.id,
-                                    MeetingModel.platform == "google_meet",
-                                    MeetingModel.deleted_at.is_(None),
-                                    MeetingModel.external_id.isnot(None),
-                                )
-                            ).scalars().all()
-                            allowed_event_ids = {
-                                str(m.external_id) for m in active_meetings if m.external_id
-                            }
-
-                        result = await auto_join_upcoming_meets(
-                            user_id=str(user.id),
-                            organization_id=str(user.organization_id),
-                            access_token=access_token,
-                            lead_time_minutes=settings.MEET_BOT_LEAD_TIME_MINUTES,
-                            stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
-                            bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
-                            recordings_dir=settings.RECORDINGS_DIR,
-                            allowed_event_ids=allowed_event_ids,
+                        from app.tasks.auto_join import run_bot_session_task
+                        run_bot_session_task.apply_async(
+                            kwargs={
+                                "meeting_id":          mid,
+                                "meet_url":            url,
+                                "user_id":             uid,
+                                "organization_id":     org_id,
+                                "platform":            platform,
+                                "bot_display_name":    settings.MEET_BOT_DISPLAY_NAME,
+                                "stay_duration_seconds": settings.MEET_BOT_STAY_DURATION_SECONDS,
+                                "recordings_dir":      settings.RECORDINGS_DIR,
+                                "attempt":             1,
+                            },
+                            queue="bots",
                         )
-                        if result.get("triggered", 0):
-                            logger.info(f"[AutoJoin] user={user.id} triggered={result['triggered']} meetings={result.get('meetings')}")
-                    except Exception as user_exc:
-                        logger.debug(f"[AutoJoin] skipped user={user.id}: {user_exc}")
+                        logger.info("[AutoJoin] enqueued Celery bot  meeting=%s  platform=%s", mid, platform)
+                        continue
+                    except Exception as celery_err:
+                        logger.debug("[AutoJoin] Celery unavailable (%s) — using in-process bot", celery_err)
+
+                    # In-process fallback (dev / no Celery)
+                    if not await acquire_lock(mid):
+                        logger.debug("[AutoJoin] lock held  meeting=%s", mid)
+                        continue
+
+                    if platform == "zoom":
+                        from app.services.zoom_bot import join_zoom_meeting
+                        asyncio.create_task(join_zoom_meeting(
+                            zoom_url=url, user_id=uid, organization_id=org_id,
+                            meeting_id=mid,
+                            bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
+                            stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
+                            recordings_dir=settings.RECORDINGS_DIR,
+                        ), name=f"zoom_bot:{mid}")
+                    else:
+                        from app.services.meet_bot import join_google_meet
+                        asyncio.create_task(join_google_meet(
+                            meet_url=url, user_id=uid, organization_id=org_id,
+                            meeting_id=mid,
+                            bot_display_name=settings.MEET_BOT_DISPLAY_NAME,
+                            stay_duration_seconds=settings.MEET_BOT_STAY_DURATION_SECONDS,
+                            recordings_dir=settings.RECORDINGS_DIR,
+                        ), name=f"meet_bot:{mid}")
+                    logger.info("[AutoJoin] dispatched in-process bot  meeting=%s  platform=%s", mid, platform)
+
             except Exception as exc:
                 logger.error(f"[AutoJoin] scheduler loop error: {exc}", exc_info=True)
 

@@ -417,7 +417,12 @@ async () => {
 
     const recorder = new MediaRecorder(dest.stream, { mimeType, audioBitsPerSecond: 128000 });
     recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) state.chunks.push(e.data);
+        if (e.data && e.data.size > 0) {
+            // Save first chunk as init segment — WebM header, needed to make
+            // each extracted window a valid standalone file for Whisper.
+            if (!state.initChunk) state.initChunk = e.data;
+            state.chunks.push(e.data);
+        }
     };
     recorder.start(2000);
     state.recorder = recorder;
@@ -450,6 +455,37 @@ async () => {
 
         state.recorder.stop();
         if (state.audioCtx) state.audioCtx.close().catch(() => {});
+    });
+}
+"""
+
+# Called every N seconds during the meeting to extract the current audio window.
+# Returns a base64-encoded webm blob (with WebM init headers prepended so Whisper
+# can decode it as a standalone file) or null if no new audio.
+EXTRACT_CHUNK_SCRIPT = """
+async () => {
+    const state = window._syncMinds;
+    if (!state || !state.recorder || !state.chunks || state.chunks.length === 0) return null;
+
+    // Drain current chunks into this window
+    const windowChunks = state.chunks.splice(0, state.chunks.length);
+    if (windowChunks.length === 0) return null;
+
+    // Prepend init segment so the window is a valid standalone WebM file.
+    // Without this, Whisper rejects the file (missing EBML header).
+    const blobParts = state.initChunk
+        ? [state.initChunk, ...windowChunks]
+        : windowChunks;
+
+    const blob = new Blob(blobParts, { type: 'audio/webm;codecs=opus' });
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            // Strip "data:audio/webm;base64," prefix
+            const b64 = reader.result ? reader.result.split(',')[1] : null;
+            resolve(b64);
+        };
+        reader.readAsDataURL(blob);
     });
 }
 """

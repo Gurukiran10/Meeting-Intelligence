@@ -18,6 +18,8 @@ from app.api.v1.endpoints import (
     search,
     patterns,
     decisions,
+    webhooks,
+    live,
 )
 
 api_router = APIRouter()
@@ -37,3 +39,5 @@ api_router.include_router(integrations.router, prefix="/integrations", tags=["In
 api_router.include_router(search.router, prefix="/search", tags=["Search"])
 api_router.include_router(patterns.router, prefix="/patterns", tags=["Patterns"])
 api_router.include_router(decisions.router, prefix="/decisions", tags=["Decisions"])
+api_router.include_router(webhooks.router, prefix="/webhooks", tags=["Webhooks"])
+api_router.include_router(live.router, prefix="/live", tags=["Live"])
