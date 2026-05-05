@@ -105,8 +105,16 @@ async def _create_pulse_sink(sink_name: str) -> Optional[int]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        module_id = int(stdout.strip())
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        raw = (stdout or b"") + (stderr or b"")
+        if not raw.strip():
+            logger.warning("Recording: pactl load-module returned empty output (PulseAudio may not have module-null-sink available)")
+            return None
+        try:
+            module_id = int(raw.strip().splitlines()[-1])
+        except ValueError:
+            logger.warning("Recording: could not parse PulseAudio module ID from: %r", raw)
+            return None
         logger.info("Recording: created PulseAudio sink %s (module %d)", sink_name, module_id)
         return module_id
     except Exception as exc:
@@ -201,13 +209,15 @@ def _get_macos_blackhole_device() -> Optional[str]:
 async def start_ffmpeg_recording(
     meeting_id: str,
     output_dir: str = "recordings",
+    precreated_sink_name: Optional[str] = None,
+    precreated_module_id: Optional[int] = None,
 ) -> Optional[RecordingSession]:
     """
     Start ffmpeg recording.  Returns a RecordingSession on success, None on failure.
 
-    On Linux, automatically creates a PulseAudio virtual sink named bot_{meeting_id}.
-    The caller MUST set PULSE_SINK=<sink_name> in the Chromium environment so browser
-    audio routes into the sink (see meet_bot._chromium_env()).
+    On Linux, uses a pre-created PulseAudio sink if provided (via prepare_audio_sink),
+    otherwise creates one.  The caller MUST set PULSE_SINK=<sink_name> in the
+    Chromium environment so browser audio routes into the sink.
     """
     if not await _is_ffmpeg_available():
         logger.warning("Recording: ffmpeg not found — skipping ffmpeg recording")
@@ -217,10 +227,10 @@ async def start_ffmpeg_recording(
     RECORDINGS_DIR = Path(output_dir)
     output_path = _recording_path(meeting_id, "wav")
 
-    pulse_sink_name: Optional[str] = None
-    pulse_module_id: Optional[int] = None
+    pulse_sink_name: Optional[str] = precreated_sink_name
+    pulse_module_id: Optional[int] = precreated_module_id
 
-    if platform.system() == "Linux":
+    if platform.system() == "Linux" and pulse_sink_name is None:
         pulse_sink_name = f"bot_{meeting_id.replace('-', '_')[:20]}"
         pulse_module_id = await _create_pulse_sink(pulse_sink_name)
 
@@ -397,9 +407,21 @@ async () => {
     state.destination = dest;
 
     let connected = 0;
+    state._keepalive = state._keepalive || [];
     candidates.forEach(({ track }) => {
         try {
-            const src = ctx.createMediaStreamSource(new MediaStream([track]));
+            const stream = new MediaStream([track]);
+            
+            // CRITICAL WORKAROUND for Chromium bug: WebRTC remote tracks are silent
+            // in Web Audio API (createMediaStreamSource) unless they are also attached
+            // to an HTMLMediaElement that is actively playing.
+            const audioEl = document.createElement('audio');
+            audioEl.autoplay = true;
+            audioEl.srcObject = stream;
+            audioEl.play().catch(e => console.warn('[SyncMinds] audioEl.play() failed', e));
+            state._keepalive.push(audioEl); // prevent garbage collection
+            
+            const src = ctx.createMediaStreamSource(stream);
             src.connect(dest);
             connected++;
         } catch(e) {
@@ -572,12 +594,22 @@ async def stop_playwright_recording(
 async def start_recording(
     meeting_id: str,
     output_dir: str = "recordings",
+    precreated_sink_name: Optional[str] = None,
+    precreated_module_id: Optional[int] = None,
 ) -> Optional[RecordingSession]:
     """
     Try ffmpeg first, return RecordingSession on success.
     Returns None if ffmpeg is unavailable (bot will fall back to Strategy B).
+
+    If precreated_sink_name/module_id are provided (via prepare_audio_sink called
+    before Chromium launch), reuses that sink so Chromium's audio is already
+    routed there when it starts.
     """
-    session = await start_ffmpeg_recording(meeting_id, output_dir)
+    session = await start_ffmpeg_recording(
+        meeting_id, output_dir,
+        precreated_sink_name=precreated_sink_name,
+        precreated_module_id=precreated_module_id,
+    )
     if session is not None:
         return session
     logger.info("Recording: ffmpeg unavailable — will use Playwright MediaRecorder after join")
@@ -608,6 +640,28 @@ async def stop_recording(
 
     logger.error("Recording: unknown strategy %s", session.strategy)
     return None
+
+
+async def prepare_audio_sink(meeting_id: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Create a PulseAudio null sink for bot audio capture.
+    Call this BEFORE launching Chromium so PULSE_SINK can be passed to the
+    Chromium environment — Zoom WebRTC audio will then route to this sink.
+
+    Returns (sink_name, module_id). Caller stores module_id for cleanup via
+    remove_audio_sink() when the session ends.
+    """
+    if platform.system() != "Linux":
+        return None, None
+    sink_name = f"bot_{meeting_id.replace('-', '_')[:20]}"
+    module_id = await _create_pulse_sink(sink_name)
+    return sink_name, module_id
+
+
+async def remove_audio_sink(module_id: Optional[int]) -> None:
+    """Remove a PulseAudio sink created by prepare_audio_sink()."""
+    if module_id is not None:
+        await _remove_pulse_sink(module_id)
 
 
 def get_pulse_sink_env(session: Optional[RecordingSession]) -> dict:

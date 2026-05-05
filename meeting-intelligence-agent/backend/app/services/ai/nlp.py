@@ -30,6 +30,8 @@ except ImportError:
 
 # Groq uses the same OpenAI-compatible SDK
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+# Gemini uses OpenAI-compatible endpoint (free tier)
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
 class MentionDetection(BaseModel):
@@ -86,6 +88,16 @@ class NLPService:
     """Natural Language Processing Service"""
     
     def __init__(self):
+        # Gemini — free tier, OpenAI-compatible. Highest priority when key is set.
+        self.gemini_client = (
+            AsyncOpenAI(
+                api_key=settings.GEMINI_API_KEY,
+                base_url=getattr(settings, "GEMINI_BASE_URL", GEMINI_BASE_URL),
+            )
+            if (getattr(settings, "GEMINI_API_KEY", "") and AsyncOpenAI is not None)
+            else None
+        )  # type: ignore
+
         self.grok_client = (
             AsyncOpenAI(api_key=settings.GROK_API_KEY, base_url=settings.GROK_BASE_URL)
             if (settings.GROK_API_KEY and AsyncOpenAI is not None)
@@ -97,6 +109,14 @@ class NLPService:
             if (settings.GROQ_API_KEY and AsyncOpenAI is not None)
             else None
         )  # type: ignore
+
+        # Log which providers are active at startup
+        active = []
+        if self.gemini_client: active.append("Gemini")
+        if self.anthropic_client: active.append("Anthropic")
+        if self.groq_client: active.append("Groq")
+        if self.grok_client: active.append("Grok")
+        logger.info("[NLP] Active LLM providers: %s", active or ["offline-heuristic"])
 
     def _safe_list(self, value: Any) -> List[str]:
         if isinstance(value, list):
@@ -419,6 +439,29 @@ class NLPService:
 
     async def _try_generate_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 4000) -> Dict:
         """Single-pass attempt: try each configured LLM client, return first valid JSON."""
+
+        # ── 0. Gemini (free tier, OpenAI-compatible) ─────────────────────────
+        if self.gemini_client:
+            try:
+                gemini_model = getattr(settings, "GEMINI_MODEL", "gemini-2.0-flash")
+                response = await self.gemini_client.chat.completions.create(
+                    model=gemini_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                raw = response.choices[0].message.content or "{}"  # type: ignore
+                logger.debug("Gemini raw response (first 300): %s", raw[:300])
+                parsed = self._extract_json_from_text(raw)
+                if parsed:
+                    return parsed
+            except Exception as exc:
+                logger.warning(f"[NLP] Gemini generation failed: {exc}")
+
+        # ── 1. Anthropic (Claude) ────────────────────────────────────────────
         if self.anthropic_client:
             try:
                 if hasattr(self.anthropic_client, "messages"):
@@ -454,10 +497,11 @@ class NLPService:
                 if parsed:
                     return parsed
             except Exception as exc:
-                logger.warning(f"Claude generation failed: {exc}")
+                logger.warning(f"[NLP] Claude generation failed: {exc}")
 
-        # Try Groq (free tier available, fast)
+        # ── 2. Groq (fast inference, free tier) ──────────────────────────────
         if self.groq_client:
+            # First attempt: with json_object mode (fastest, most structured)
             try:
                 response = await self.groq_client.chat.completions.create(  # type: ignore
                     model=settings.GROQ_MODEL,
@@ -470,12 +514,31 @@ class NLPService:
                     max_tokens=max_tokens,
                 )
                 raw = response.choices[0].message.content or "{}"  # type: ignore
-                logger.debug("Groq raw response (first 300): %s", raw[:300])
+                logger.debug("[NLP] Groq raw response (first 300): %s", raw[:300])
                 return json.loads(raw)
             except Exception as exc:
-                logger.warning(f"Groq generation failed: {exc}")
+                logger.warning(f"[NLP] Groq (json_object mode) failed: {exc} — retrying without response_format")
 
-        # Fallback to Grok (xAI)
+            # Second attempt: without json_object mode (more compatible)
+            try:
+                response = await self.groq_client.chat.completions.create(  # type: ignore
+                    model=settings.GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt + "\n\nIMPORTANT: Reply with ONLY valid JSON. No markdown, no explanation."},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                raw = response.choices[0].message.content or "{}"  # type: ignore
+                logger.debug("[NLP] Groq (plain) raw response (first 300): %s", raw[:300])
+                parsed = self._extract_json_from_text(raw)
+                if parsed:
+                    return parsed
+            except Exception as exc:
+                logger.warning(f"[NLP] Groq (plain mode) also failed: {exc}")
+
+        # ── 3. Grok (xAI) ────────────────────────────────────────────────────
         if self.grok_client:
             try:
                 response = await self.grok_client.chat.completions.create(  # type: ignore
@@ -489,11 +552,19 @@ class NLPService:
                     max_tokens=max_tokens,
                 )
                 raw = response.choices[0].message.content or "{}"  # type: ignore
-                logger.debug("Grok raw response (first 300): %s", raw[:300])
+                logger.debug("[NLP] Grok raw response (first 300): %s", raw[:300])
                 return json.loads(raw)
             except Exception as exc:
-                logger.warning(f"Grok generation failed: {exc}")
+                logger.warning(f"[NLP] Grok generation failed: {exc}")
 
+        logger.error(
+            "[NLP] ALL LLM providers failed (Gemini=%s Anthropic=%s Groq=%s Grok=%s). "
+            "Falling back to offline heuristic.",
+            self.gemini_client is not None,
+            self.anthropic_client is not None,
+            self.groq_client is not None,
+            self.grok_client is not None,
+        )
         return {}
     
     async def detect_mentions(
@@ -647,6 +718,12 @@ Return a JSON array of action items.
             except Exception as e:
                 logger.warning(f"Failed to parse action item: {e}")
         
+        # ── FALLBACK ────────────────────────────────────────────────────────
+        if not action_items:
+            logger.warning("No action items extracted by AI — using offline fallback")
+            offline = self._build_offline_summary(transcript, "Meeting")
+            return offline.action_items
+
         logger.info(f"Extracted {len(action_items)} action items")
         return action_items
 
@@ -1017,9 +1094,15 @@ RETURN JSON ONLY."""
         summary_data = await self._generate_json(
             system_prompt=system_prompt,
             user_prompt=prompt,
-            temperature=0.2,
-            max_tokens=4000,
+            temperature=0.1,
         )
+
+        # ── FALLBACK ────────────────────────────────────────────────────────
+        # If the model returned nothing (rate limit, error, etc), use the offline heuristic
+        if not summary_data or not summary_data.get("summary"):
+            logger.warning("AI summary generation returned no data — falling back to offline heuristic")
+            return self._build_offline_summary(transcript, meeting_title)
+
         logger.info(f"Summary data returned: {summary_data}")
         
         # Handle nested response from Groq API

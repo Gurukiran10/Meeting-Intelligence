@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, cast, String
 from sqlalchemy.orm import Session
 
 from app.models.action_item import ActionItem
@@ -42,8 +42,7 @@ class MeetingAnalyticsService:
                 select(Meeting).where(
                     or_(
                         Meeting.organizer_id == getattr(current_user, "id", None),
-                        Meeting.attendee_ids.contains([str(getattr(current_user, "id", ""))]),
-                        Meeting.attendee_ids.contains(str(getattr(current_user, "id", ""))),
+                        cast(Meeting.attendee_ids, String).ilike(f"%{getattr(current_user, 'id', '')}%"),
                     )
                 )
             ).scalars().all()

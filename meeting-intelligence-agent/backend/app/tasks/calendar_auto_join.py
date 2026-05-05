@@ -143,7 +143,7 @@ async def _run_for_all_users() -> list[dict]:
 
                 # ── Fetch calendar events ────────────────────────────────
                 now_utc = datetime.now(timezone.utc)
-                lead_time = 2  # minutes
+                lead_time = 5  # minutes — wider window to reliably catch meetings
                 time_min = (now_utc - timedelta(minutes=lead_time)).isoformat().replace("+00:00", "Z")
                 time_max = (now_utc + timedelta(minutes=lead_time + 1)).isoformat().replace("+00:00", "Z")
 
@@ -228,6 +228,19 @@ async def _run_for_all_users() -> list[dict]:
                             mdb.commit()
                             mdb.refresh(new_meeting)
                             meeting_id = str(new_meeting.id)
+
+                    # ── Check bot_state to avoid duplicate dispatch ────────
+                    from app.services.bot_state import get_bot_state, BotStatus
+                    state = await get_bot_state(meeting_id)
+                    if state and state.get("status") not in (
+                        None, "", BotStatus.PENDING, BotStatus.COMPLETED,
+                        BotStatus.FAILED, BotStatus.HOST_ABSENT, BotStatus.BOT_REJECTED,
+                    ):
+                        logger.debug(
+                            "auto_join: skipping %s — bot already active (state=%s)",
+                            meeting_id, state.get("status"),
+                        )
+                        continue
 
                     # ── Dispatch to bots queue ────────────────────────────
                     logger.info(

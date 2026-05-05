@@ -25,6 +25,9 @@ from app.services.pre_meeting_briefs import pre_meeting_brief_service
 from app.services.meeting_importance import score_meeting_for_user
 from app.services.attendee_optimization import analyze_participation
 from app.services.collaborative_prep import get_prep_summary
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -343,13 +346,26 @@ async def _delete_google_calendar_event(
     calendar_id: str = "primary",
 ) -> None:
     """Delete a Google Calendar event by event_id. Silently ignores 404 (already deleted)."""
+    _logger = logging.getLogger(__name__)
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.delete(
             f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
             headers={"Authorization": f"Bearer {access_token}"},
         )
     if resp.status_code not in (200, 204, 404):
-        logger.warning("Google Calendar delete returned %s: %s", resp.status_code, resp.text[:200])
+        _logger.warning("Google Calendar delete returned %s: %s", resp.status_code, resp.text[:200])
+
+
+async def _delete_zoom_meeting(access_token: str, meeting_id: str) -> None:
+    """Delete a Zoom meeting by meeting_id. Silently ignores 404."""
+    _logger = logging.getLogger(__name__)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.delete(
+            f"https://api.zoom.us/v2/meetings/{meeting_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if resp.status_code not in (200, 204, 404):
+        _logger.warning("Zoom delete returned %s: %s", resp.status_code, resp.text[:200])
 
 
 @router.post("/", response_model=MeetingResponse, status_code=status.HTTP_201_CREATED)
@@ -485,7 +501,7 @@ async def list_meetings(
 
     if not _is_admin(current_user):
         attendee_filters = [
-            cast(Meeting.attendee_ids, String).contains(token)
+            cast(Meeting.attendee_ids, String).ilike(f'%{token}%')
             for token in _user_attendee_tokens(current_user)
         ]
         query = query.where(
@@ -755,6 +771,15 @@ async def delete_meeting(
                 await _delete_google_calendar_event(access_token, event_id, calendar_id)
         except Exception as exc:
             logger.warning("Could not delete Google Calendar event %s: %s", event_id, exc)
+
+    if event_id and platform == "zoom":
+        try:
+            from app.api.v1.endpoints.integrations import _get_zoom_access_token
+            zoom_token = await _get_zoom_access_token(db, current_user)
+            if zoom_token:
+                await _delete_zoom_meeting(zoom_token, event_id)
+        except Exception as exc:
+            logger.warning("Could not delete Zoom meeting %s: %s", event_id, exc)
 
     meeting.deleted_at = datetime.utcnow()  # type: ignore
     db.commit()

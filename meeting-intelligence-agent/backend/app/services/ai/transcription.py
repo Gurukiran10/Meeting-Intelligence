@@ -65,8 +65,31 @@ class TranscriptionService:
 
         groq_key = settings.GROQ_API_KEY or settings.GROK_API_KEY
         if not GROQ_AVAILABLE or not groq_key:
-            raise RuntimeError("No transcription backend available. Set ASSEMBLYAI_API_KEY or GROQ_API_KEY.")
-        return await self._transcribe_with_groq(audio_path, groq_key)
+            logger.warning("No cloud transcription provider available — using placeholder")
+            return self._build_placeholder_result(audio_path)
+
+        try:
+            return await self._transcribe_with_groq(audio_path, groq_key)
+        except Exception as e:
+            logger.error(f"Cloud transcription failed: {e}")
+            return self._build_placeholder_result(audio_path)
+
+    def _build_placeholder_result(self, audio_path: str) -> TranscriptionResult:
+        """Fallback result when all transcription APIs fail"""
+        return TranscriptionResult(
+            segments=[
+                TranscriptionSegment(
+                    start=0.0,
+                    end=1.0,
+                    text="[Transcription unavailable — AI provider rate limited or offline]",
+                    speaker="System",
+                    confidence=0.0
+                )
+            ],
+            language="en",
+            duration=0.0,
+            diarization_method="fallback",
+        )
 
     # ── AssemblyAI ─────────────────────────────────────────────────────────
 
@@ -78,8 +101,17 @@ class TranscriptionService:
     ) -> TranscriptionResult:
         headers = {"authorization": api_key}
 
-        # 1. Upload audio
-        file_size_mb = Path(audio_path).stat().st_size / 1_048_576
+        # 1. Guard: skip AssemblyAI for very small files (< 50 KB).
+        # Files this small are essentially silence and AssemblyAI returns 400.
+        file_size_bytes = Path(audio_path).stat().st_size
+        file_size_mb = file_size_bytes / 1_048_576
+        if file_size_bytes < 50_000:
+            raise RuntimeError(
+                f"AssemblyAI skipped — file too small ({file_size_bytes} bytes). "
+                f"Likely a silent/cancelled recording."
+            )
+
+        # 2. Upload audio
         logger.info("AssemblyAI: uploading audio %s (%.1f MB)", audio_path, file_size_mb)
         # Allow up to 10 min for large recordings (180s upload + read timeout)
         upload_timeout = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
@@ -95,7 +127,7 @@ class TranscriptionService:
         audio_url = upload_resp.json()["upload_url"]
         logger.info("AssemblyAI: audio uploaded → %s", audio_url)
 
-        # 2. Request transcription with speaker diarization
+        # 3. Request transcription with speaker diarization
         async with httpx.AsyncClient(timeout=30.0) as client:
             transcript_resp = await client.post(
                 f"{ASSEMBLYAI_BASE}/transcript",
@@ -105,6 +137,13 @@ class TranscriptionService:
                     "speaker_labels": True,
                     "language_detection": True,
                 },
+            )
+        # A 400 from AssemblyAI means the audio is invalid/too short — treat
+        # as a soft failure so we fall through to Groq.
+        if transcript_resp.status_code == 400:
+            raise RuntimeError(
+                f"AssemblyAI rejected audio (400) — likely too short or silent. "
+                f"Response: {transcript_resp.text[:200]}"
             )
         transcript_resp.raise_for_status()
         transcript_id = transcript_resp.json()["id"]
@@ -162,8 +201,9 @@ class TranscriptionService:
 
     async def _transcribe_with_groq(self, audio_path: str, api_key: str) -> TranscriptionResult:
         def _call():
-            client = GroqClient(api_key=api_key)
+            client = GroqClient(api_key=api_key, timeout=600.0)
             with open(audio_path, "rb") as f:
+
                 return client.audio.transcriptions.create(
                     file=(Path(audio_path).name, f),
                     model="whisper-large-v3-turbo",

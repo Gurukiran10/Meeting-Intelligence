@@ -80,7 +80,8 @@ class LivePipeline:
         self._running        = False
         self._elapsed_s      = 0.0
         self._total_segments = 0
-        self._intel          = None
+        self._intel: Optional[Any]  = None
+        self._rec_engine: Optional[Any] = None
 
         # Accumulate detected events for DB persistence on stop()
         self._detected_action_items: List[dict] = []
@@ -123,6 +124,7 @@ class LivePipeline:
     async def _loop(self) -> None:
         try:
             from app.services.intelligence import RealTimeIntelligence
+            from app.services.recommendations import RecommendationEngine
             self._intel = RealTimeIntelligence(
                 meeting_id=self.meeting_id,
                 attendee_names=self.attendee_names,
@@ -131,10 +133,16 @@ class LivePipeline:
                 current_user_name=self.current_user_name,
                 organization_id=self.organization_id,
             )
-            logger.info("[LivePipeline] intelligence enabled  meeting=%s", self.meeting_id)
+            self._rec_engine = RecommendationEngine(
+                meeting_id=self.meeting_id,
+                current_user_id=self.current_user_id,
+                current_user_name=self.current_user_name,
+            )
+            logger.info("[LivePipeline] intelligence + recommendation engine enabled  meeting=%s", self.meeting_id)
         except Exception as exc:
             logger.warning("[LivePipeline] intelligence unavailable: %s", exc)
             self._intel = None
+            self._rec_engine = None
 
         start_wall = time.monotonic()
         last_heartbeat = 0.0
@@ -189,7 +197,9 @@ class LivePipeline:
                     "text": clean, "t": t,
                 })
 
-            # Intelligence layer
+            # Intelligence layer — runs first so its events are available
+            # to record_action_item() inside the recommendation engine
+            intel_events: List[dict] = []
             if self._intel is not None:
                 try:
                     intel_events = await self._intel.process(clean, self._elapsed_s)
@@ -202,6 +212,25 @@ class LivePipeline:
                             self._detected_decisions.append(ev)
                 except Exception as exc:
                     logger.debug("[LivePipeline] intelligence error: %s", exc)
+
+            # Recommendation engine — evaluates after intelligence so it can
+            # record action items assigned to the current user and suppress
+            # redundant join_now signals
+            if self._rec_engine is not None:
+                try:
+                    rec = self._rec_engine.process_segment(
+                        clean, self._elapsed_s, self._publish_to_redis,
+                    )
+                    # Record action items assigned to current user so the
+                    # engine suppresses redundant join_now signals
+                    if rec and rec.action == "join_now":
+                        for ai_ev in intel_events:
+                            if ai_ev.get("type") == "action_item":
+                                target = ai_ev.get("target_user_id")
+                                if target and target == self.current_user_id:
+                                    self._rec_engine.record_action_item(ai_ev)
+                except Exception as exc:
+                    logger.debug("[LivePipeline] recommendation error: %s", exc)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -240,6 +269,9 @@ class LivePipeline:
         return await loop.run_in_executor(None, _call)
 
     async def _publish(self, event: dict) -> None:
+        await self._publish_to_redis(event)
+
+    async def _publish_to_redis(self, event: dict) -> None:
         from app.core.redis import redis_client
         if not redis_client:
             return

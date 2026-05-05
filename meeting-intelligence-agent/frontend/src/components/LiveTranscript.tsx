@@ -66,6 +66,8 @@ const TOAST_META: Record<string, { icon: string; label: string; color: string }>
   decision:     { icon: '⚖️', label: 'Decision',     color: 'border-purple-200 bg-purple-50 text-purple-900' },
   mention:      { icon: '👤', label: 'Mention',       color: 'border-amber-200  bg-amber-50  text-amber-900'  },
   confirmation: { icon: '✅', label: 'Confirmed',     color: 'border-green-200  bg-green-50  text-green-900'  },
+  interrupt:     { icon: '🔴', label: 'Urgent',       color: 'border-red-200    bg-red-50    text-red-900'    },
+  recommendation: { icon: '⚡', label: 'Recommendation', color: 'border-orange-200 bg-orange-50 text-orange-900' },
 }
 
 function Toast({ toast, onDismiss }: { toast: ToastEntry; onDismiss: (id: string) => void }) {
@@ -162,7 +164,7 @@ export default function LiveTranscript({ meetingId, currentUserId, className = '
   const {
     connected, pipelineStatus, elapsedS,
     segments, mentions, actionItems, decisions,
-    toasts, error, dismissToast,
+    recommendation, toasts, error, dismissToast,
   } = useLiveMeeting(meetingId, { currentUserId })
 
   // Auto-scroll transcript
@@ -234,6 +236,7 @@ export default function LiveTranscript({ meetingId, currentUserId, className = '
         <LiveIntelligencePanel
           actionItems={actionItems}
           decisions={decisions}
+          recommendation={recommendation}
           currentUserId={currentUserId}
           personalFilter={personalFilter}
         />

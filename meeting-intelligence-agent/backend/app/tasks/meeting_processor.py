@@ -158,7 +158,7 @@ def _normalize_meeting_id(meeting_id: str | UUID) -> Optional[UUID]:
         return None
 
 
-@shared_task(name="process_meeting_recording")
+@shared_task(name="process_meeting_recording", queue="bots")
 def process_meeting_recording(meeting_id: str | UUID, recording_path: str):
     """
     Process meeting recording:
@@ -219,6 +219,19 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
         candidate_users = []
 
         try:
+            # Step 0: Verify recording file exists
+            import os
+            if not os.path.exists(recording_path):
+                logger.error(f"Recording file not found: {recording_path}")
+                raise RuntimeError(f"Recording file not found: {recording_path}")
+
+            file_size = os.path.getsize(recording_path)
+            if file_size < 1024:  # < 1KB = empty/corrupt
+                logger.error(f"Recording file too small ({file_size} bytes): {recording_path}")
+                raise RuntimeError(f"Recording file too small ({file_size} bytes)")
+
+            logger.info(f"Recording file verified: {recording_path} ({file_size // 1024} KB)")
+
             # Step 1: Transcribe
             logger.info(f"Transcribing meeting {meeting_id}")
             meeting.transcription_status = "processing"  # type: ignore
@@ -257,10 +270,67 @@ async def _process_meeting_async(meeting_id: str | UUID, recording_path: str):  
             if not transcription.segments:
                 raise RuntimeError("Transcript is empty")
 
+            # Check if transcription is a placeholder (all providers failed)
+            # In this case, save the placeholder but skip NLP analysis
+            if transcription.diarization_method == "fallback":
+                logger.warning(
+                    f"Transcription returned placeholder for meeting {meeting_id} "
+                    f"— all AI providers unavailable. Saving placeholder and marking no_audio."
+                )
+                for idx, segment in enumerate(transcription.segments):
+                    transcript = Transcript(
+                        meeting_id=meeting.id,
+                        segment_number=idx,
+                        speaker_id=segment.speaker,
+                        text=segment.text,
+                        start_time=segment.start,
+                        end_time=segment.end,
+                        duration=segment.end - segment.start,
+                        confidence=segment.confidence,
+                    )
+                    db.add(transcript)
+
+                meeting.transcription_status = "failed"  # type: ignore
+                meeting.analysis_status = "skipped"  # type: ignore
+                meeting.status = "no_audio"  # type: ignore
+                meeting.summary = "Transcription unavailable — AI provider was rate limited or offline during processing."  # type: ignore
+                meeting.meeting_metadata = {
+                    **(meeting.meeting_metadata or {}),
+                    "transcription_fallback": True,
+                    "fallback_at": datetime.utcnow().isoformat(),
+                }  # type: ignore
+                db.commit()
+                logger.info(f"Meeting {meeting_id} marked as no_audio (placeholder transcription)")
+                return  # Exit early — no NLP processing needed
+
             # Filter Whisper silence hallucinations
             transcription.segments = _filter_hallucinations(transcription.segments)
             if not transcription.segments:
-                raise RuntimeError("Transcript is empty after hallucination filtering")
+                # All segments were noise / silence — this is NOT a pipeline failure.
+                # It means the recording contained no real speech (e.g. a cancelled
+                # session, background noise only, or a very short bot-only recording).
+                # Mark the meeting as completed with a no_audio note so the user sees
+                # a clean result instead of an alarming "Failed" status.
+                logger.warning(
+                    f"Meeting {meeting_id}: all transcript segments were hallucinations "
+                    f"(silence/noise recording). Marking as completed with no_audio."
+                )
+                meeting.transcription_status = "no_audio"  # type: ignore
+                meeting.analysis_status = "skipped"  # type: ignore
+                meeting.status = "completed"  # type: ignore
+                meeting.summary = (
+                    "No speech detected in the recording. "
+                    "The meeting may have been very short or the bot joined to an empty/silent call."
+                )  # type: ignore
+                meeting.meeting_metadata = {
+                    **(meeting.meeting_metadata or {}),
+                    "no_audio": True,
+                    "no_audio_reason": "all_segments_hallucinations",
+                    "no_audio_at": datetime.utcnow().isoformat(),
+                }  # type: ignore
+                db.commit()
+                logger.info(f"Meeting {meeting_id} marked completed (no_audio) — skipping NLP.")
+                return  # Exit early — nothing to analyse
 
             # Only apply gap heuristic if AssemblyAI did NOT handle diarization
             if transcription.diarization_method != "assemblyai":

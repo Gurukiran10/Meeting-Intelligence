@@ -1466,6 +1466,19 @@ async def list_zoom_meetings(
 
     data = resp.json()
     meetings = data.get("meetings", [])
+
+    from sqlalchemy import select
+    from app.models.meeting import Meeting
+    
+    deleted_meetings = db.execute(
+        select(Meeting.external_id).where(
+            Meeting.organizer_id == current_user.id,
+            Meeting.platform == "zoom",
+            Meeting.deleted_at.isnot(None)
+        )
+    ).scalars().all()
+    deleted_ids = set([str(id) for id in deleted_meetings if id])
+
     return [
         {
             "id": m.get("id"),
@@ -1474,7 +1487,7 @@ async def list_zoom_meetings(
             "duration": m.get("duration"),
             "join_url": m.get("join_url"),
         }
-        for m in meetings
+        for m in meetings if str(m.get("id")) not in deleted_ids
     ]
 
 
@@ -2136,6 +2149,27 @@ async def list_upcoming_google_meet_events(
             calendar_id=resolved_calendar_id,
             days_ahead=min(days_ahead, 180),
         )
+        
+        # Filter out soft-deleted meetings and already processed/completed meetings
+        from sqlalchemy import select
+        from app.models.meeting import Meeting
+        
+        existing_meetings = db.execute(
+            select(Meeting.external_id, Meeting.status, Meeting.deleted_at).where(
+                Meeting.organizer_id == current_user.id,
+                Meeting.platform.in_(["meet", "google_meet"])
+            )
+        ).all()
+        
+        hide_ids = set()
+        for row in existing_meetings:
+            ext_id = str(row.external_id)
+            if row.deleted_at is not None:
+                hide_ids.add(ext_id)
+            elif row.status in ("completed", "failed", "in_progress", "processing", "transcribing"):
+                hide_ids.add(ext_id)
+        
+        events = [e for e in events if e.get("id") not in hide_ids]
     else:
         # API key path — use existing sync logic
         raise HTTPException(
@@ -2258,6 +2292,7 @@ class ZoomBotJoinRequest(BaseModel):
     zoom_url: str
     stay_duration_seconds: int = 600
     bot_display_name: str = "SyncMinds Bot"
+    topic: Optional[str] = None
 
 
 @router.post("/zoom/bot/join")
@@ -2282,6 +2317,7 @@ async def join_zoom_with_bot(
             organization_id=org_id,
             bot_display_name=req.bot_display_name,
             stay_duration_seconds=req.stay_duration_seconds,
+            topic=req.topic,
         )
     )
     return {"status": "launched", "zoom_url": req.zoom_url, "user_id": user_id}

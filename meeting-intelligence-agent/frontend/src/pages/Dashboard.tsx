@@ -43,6 +43,7 @@ const Dashboard: React.FC = () => {
   const hasToken = Boolean(getAccessToken())
   const qc = useQueryClient()
   const [joiningUrl, setJoiningUrl] = useState<string | null>(null)
+  const [zoomJoiningUrl, setZoomJoiningUrl] = useState<string | null>(null)
   
   const { data: currentUser } = useQuery('dashboard-current-user', async () => {
     const response = await api.get('/api/v1/auth/me')
@@ -149,9 +150,83 @@ const Dashboard: React.FC = () => {
     }
   )
 
+  // Zoom Meetings Hooks
+  const {
+    data: upcomingZoomData,
+    isLoading: zoomLoading,
+    refetch: refetchZooms,
+  } = useQuery(
+    'upcoming-zoom-meets',
+    async () => {
+      const res = await api.get('/api/v1/integrations/zoom/meetings')
+      return res.data
+    },
+    {
+      enabled: hasToken,
+      retry: false,
+      staleTime: 60_000,
+    }
+  )
+
+  const { data: zoomBotStatus } = useQuery(
+    'zoom-bot-status',
+    async () => {
+      const res = await api.get('/api/v1/integrations/zoom/bot/status')
+      return res.data
+    },
+    {
+      enabled: hasToken,
+      refetchInterval: zoomJoiningUrl ? 5000 : false,
+      retry: false,
+    }
+  )
+
+  const joinZoomMutation = useMutation(
+    async ({ zoomUrl, topic }: { zoomUrl: string, topic?: string }) => {
+      const res = await api.post('/api/v1/integrations/zoom/bot/join', {
+        zoom_url: zoomUrl,
+        stay_duration_seconds: 600,
+        topic: topic,
+      })
+      return res.data
+    },
+    {
+      onMutate: ({ zoomUrl }) => {
+        setZoomJoiningUrl(zoomUrl)
+      },
+      onSuccess: () => {
+        showToast('Opened Zoom tab · Bot is joining too…')
+        qc.invalidateQueries('zoom-bot-status')
+      },
+      onError: (err: any) => {
+        const detail = err?.response?.data?.detail || err?.message || 'Failed to start bot'
+        showToast(detail, 'error')
+        setZoomJoiningUrl(null)
+      },
+    }
+  )
+
+  const stopZoomBotMutation = useMutation(
+    async () => {
+      const res = await api.delete('/api/v1/integrations/zoom/bot/join')
+      return res.data
+    },
+    {
+      onSuccess: () => {
+        showToast('Zoom Bot stopped.')
+        setZoomJoiningUrl(null)
+        qc.invalidateQueries('zoom-bot-status')
+      },
+    }
+  )
+
   const upcomingMeetEvents: any[] = upcomingMeetData?.events || []
   const activeBotStatus: string | undefined = botStatus?.status
   const botIsActive = activeBotStatus && !['idle', 'completed', 'failed', 'cancelled'].includes(activeBotStatus)
+
+  const upcomingZoomEvents: any[] = upcomingZoomData || []
+  const activeZoomBotStatus: string | undefined = zoomBotStatus?.status
+  const zoomBotIsActive = activeZoomBotStatus && !['idle', 'completed', 'failed', 'cancelled'].includes(activeZoomBotStatus)
 
   const stats = [
     {
@@ -403,163 +478,293 @@ const Dashboard: React.FC = () => {
         </CardContent>
       </Card>
 
-      {/* Upcoming Google Meet Events with Join Bot */}
-      <Card className="border-slate-200/60 shadow-sm">
-        <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
-          <div className="space-y-1">
-            <CardTitle className="text-xl font-bold flex items-center gap-2">
-              <Video className="w-5 h-5 text-blue-500" />
-              Upcoming Google Meets
-            </CardTitle>
-            <CardDescription>
-              Click "Join" to send a silent bot into the meeting that captures audio and context.
-            </CardDescription>
-          </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-slate-500 hover:text-blue-600"
-            onClick={() => refetchMeets()}
-          >
-            <RefreshCw className="w-4 h-4 mr-1" />
-            Refresh
-          </Button>
-        </CardHeader>
-        <CardContent className="pt-4">
-          {/* Bot status banner */}
-          {activeBotStatus && activeBotStatus !== 'idle' && (
-            <div
-              className={cn(
-                'mb-4 flex items-center justify-between rounded-xl border px-4 py-3 text-sm font-semibold',
-                botIsActive
-                  ? 'border-blue-200 bg-blue-50 text-blue-800'
-                  : activeBotStatus === 'completed'
-                  ? 'border-green-200 bg-green-50 text-green-800'
-                  : 'border-red-200 bg-red-50 text-red-800',
-              )}
+      {/* Integrations Grid: Google & Zoom side-by-side */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-8">
+        {/* Upcoming Google Meet Events with Join Bot */}
+        <Card className="border-slate-200/60 shadow-sm flex flex-col">
+          <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
+            <div className="space-y-1">
+              <CardTitle className="text-xl font-bold flex items-center gap-2">
+                <Video className="w-5 h-5 text-blue-500" />
+                Upcoming Google Meets
+              </CardTitle>
+              <CardDescription>
+                Silent bot for Google Meet capture.
+              </CardDescription>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-slate-500 hover:text-blue-600"
+              onClick={() => refetchMeets()}
             >
-              <span className="flex items-center gap-2">
-                {botIsActive && <Loader2 className="w-4 h-4 animate-spin" />}
-                Bot status: <span className="capitalize">{activeBotStatus?.replace(/_/g, ' ')}</span>
-                {botStatus?.meet_url && (
-                  <span className="font-normal text-xs opacity-70 truncate max-w-[220px]">
-                    — {botStatus.meet_url}
-                  </span>
+              <RefreshCw className="w-4 h-4 mr-1" />
+              Refresh
+            </Button>
+          </CardHeader>
+          <CardContent className="pt-4 flex-1">
+            {/* Bot status banner */}
+            {activeBotStatus && activeBotStatus !== 'idle' && (
+              <div
+                className={cn(
+                  'mb-4 flex items-center justify-between rounded-xl border px-4 py-3 text-sm font-semibold',
+                  botIsActive
+                    ? 'border-blue-200 bg-blue-50 text-blue-800'
+                    : activeBotStatus === 'completed'
+                    ? 'border-green-200 bg-green-50 text-green-800'
+                    : 'border-red-200 bg-red-50 text-red-800',
                 )}
-              </span>
-              {botIsActive && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="border-red-300 text-red-600 hover:bg-red-50"
-                  onClick={() => stopBotMutation.mutate()}
-                  disabled={stopBotMutation.isLoading}
-                >
-                  <Square className="w-3 h-3 mr-1 fill-current" />
-                  Stop Bot
-                </Button>
-              )}
-            </div>
-          )}
-
-          {meetLoading ? (
-            <div className="py-10 flex justify-center">
-              <Loader2 className="w-6 h-6 animate-spin text-slate-300" />
-            </div>
-          ) : upcomingMeetEvents.length === 0 ? (
-            <div className="py-12 text-center">
-              <div className="bg-slate-50 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4">
-                <Video className="w-6 h-6 text-slate-300" />
-              </div>
-              <p className="text-sm text-slate-400 font-medium">
-                {upcomingMeetData === undefined
-                  ? 'Connect Google Calendar to see upcoming meetings.'
-                  : 'No Google Meet events in the next 7 days.'}
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {upcomingMeetEvents.slice(0, 6).map((event: any, idx: number) => {
-                const meetUrl: string = event._meet_url || event.hangoutLink || ''
-                const title: string = event.summary || 'Untitled Meeting'
-                const startRaw: string = event.start?.dateTime || event.start?.date || ''
-                const startDate = startRaw ? new Date(startRaw) : null
-                const isJoiningThis = joiningUrl === meetUrl && joinMeetMutation.isLoading
-                const isThisBotActive = botIsActive && botStatus?.meet_url === meetUrl
-
-                return (
-                  <div
-                    key={event.id || idx}
-                    className="flex items-center justify-between rounded-xl border border-slate-100 px-4 py-3 hover:bg-slate-50/50 transition-all"
+              >
+                <span className="flex items-center gap-2">
+                  {botIsActive && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Status: <span className="capitalize">{
+                    activeBotStatus === 'waiting_admission' ? 'Waiting Room' : 
+                    activeBotStatus === 'pre_join' ? 'Preparing' :
+                    activeBotStatus === 'recording' ? 'Recording' :
+                    activeBotStatus?.replace(/_/g, ' ')
+                  }</span>
+                </span>
+                {botIsActive && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="border-red-300 text-red-600 hover:bg-red-50"
+                    onClick={() => stopBotMutation.mutate()}
+                    disabled={stopBotMutation.isLoading}
                   >
-                    <div className="flex items-center gap-3 flex-1 min-w-0">
-                      <div className="bg-blue-50 p-2 rounded-lg flex-shrink-0">
-                        <Video className="w-4 h-4 text-blue-500" />
-                      </div>
-                      <div className="min-w-0">
-                        <p className="text-sm font-bold text-slate-900 truncate">{title}</p>
-                        {startDate && (
-                          <p className="text-xs text-slate-500 mt-0.5 font-medium flex items-center gap-1">
-                            <Clock className="w-3 h-3" />
-                            {startDate.toLocaleDateString()} at{' '}
-                            {startDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                          </p>
-                        )}
-                      </div>
-                    </div>
+                    <Square className="w-3 h-3 mr-1 fill-current" />
+                    Stop
+                  </Button>
+                )}
+              </div>
+            )}
 
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      {meetUrl && (
-                        <a
-                          href={meetUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-xs text-blue-500 hover:text-blue-700 font-semibold underline underline-offset-2"
+            {meetLoading ? (
+              <div className="py-10 flex justify-center">
+                <Loader2 className="w-6 h-6 animate-spin text-slate-300" />
+              </div>
+            ) : upcomingMeetEvents.length === 0 ? (
+              <div className="py-12 text-center">
+                <div className="bg-slate-50 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <Video className="w-6 h-6 text-slate-300" />
+                </div>
+                <p className="text-sm text-slate-400 font-medium">
+                  {upcomingMeetData === undefined
+                    ? 'Connect Google Calendar.'
+                    : 'No Google Meet events found.'}
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {upcomingMeetEvents.slice(0, 5).map((event: any, idx: number) => {
+                  const meetUrl: string = event._meet_url || event.hangoutLink || ''
+                  const title: string = event.summary || 'Untitled Meeting'
+                  const startRaw: string = event.start?.dateTime || event.start?.date || ''
+                  const startDate = startRaw ? new Date(startRaw) : null
+                  const isJoiningThis = joiningUrl === meetUrl && joinMeetMutation.isLoading
+                  const isThisBotActive = botIsActive && botStatus?.meet_url === meetUrl
+
+                  return (
+                    <div
+                      key={event.id || idx}
+                      className="flex items-center justify-between rounded-xl border border-slate-100 px-4 py-3 hover:bg-slate-50/50 transition-all"
+                    >
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-slate-900 truncate">{title}</p>
+                          {startDate && (
+                            <p className="text-[11px] text-slate-500 mt-0.5 font-medium flex items-center gap-1">
+                              <Clock className="w-3 h-3" />
+                              {startDate.toLocaleDateString()} {startDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-8 text-[11px] text-blue-600 font-bold"
+                          onClick={() => window.open(meetUrl, '_blank')}
+                          disabled={!meetUrl}
                         >
                           Open
-                        </a>
-                      )}
-                      <Button
-                        size="sm"
-                        disabled={!meetUrl || isJoiningThis || isThisBotActive}
-                        className={cn(
-                          'text-xs font-bold h-8 px-3',
-                          isThisBotActive
-                            ? 'bg-green-600 hover:bg-green-700 cursor-default'
-                            : 'bg-blue-600 hover:bg-blue-700',
-                        )}
-                        onClick={() => {
-                          console.log('[BOT] Join clicked — meetUrl:', meetUrl, '| event:', event)
-                          if (!meetUrl) {
-                            console.warn('[BOT] meetUrl is empty — button should have been disabled')
-                            return
-                          }
-                          window.open(meetUrl, '_blank', 'noopener,noreferrer')
-                          joinMeetMutation.mutate(meetUrl)
-                        }}
-                      >
-                        {isJoiningThis ? (
-                          <Loader2 className="w-3 h-3 animate-spin" />
-                        ) : isThisBotActive ? (
-                          <>
-                            <CheckCircle className="w-3 h-3 mr-1" />
-                            Joined
-                          </>
-                        ) : (
-                          <>
-                            <Play className="w-3 h-3 mr-1 fill-current" />
-                            Join
-                          </>
-                        )}
-                      </Button>
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={!meetUrl || isJoiningThis || isThisBotActive}
+                          className={cn(
+                            'text-xs font-bold h-8 px-3',
+                            isThisBotActive
+                              ? 'bg-green-600 hover:bg-green-700'
+                              : 'bg-blue-600 hover:bg-blue-700',
+                          )}
+                          onClick={() => {
+                            if (!meetUrl) return
+                            setJoiningUrl(meetUrl)
+                            joinMeetMutation.mutate(meetUrl)
+                          }}
+                        >
+                          {isJoiningThis ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : isThisBotActive ? (
+                            'Joined'
+                          ) : (
+                            'Join'
+                          )}
+                        </Button>
+                      </div>
                     </div>
-                  </div>
-                )
-              })}
+                  )
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Upcoming Zoom Meets Card */}
+        <Card className="border-slate-200/60 shadow-sm flex flex-col">
+          <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
+            <div className="space-y-1">
+              <CardTitle className="text-xl font-bold flex items-center gap-2">
+                <Video className="w-5 h-5 text-purple-500" />
+                Upcoming Zoom Meets
+              </CardTitle>
+              <CardDescription>
+                Silent bot for Zoom meeting capture.
+              </CardDescription>
             </div>
-          )}
-        </CardContent>
-      </Card>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-slate-500 hover:text-blue-600"
+              onClick={() => refetchZooms()}
+            >
+              <RefreshCw className="w-4 h-4 mr-1" />
+              Refresh
+            </Button>
+          </CardHeader>
+          <CardContent className="pt-4 flex-1">
+            {/* Zoom Bot status banner */}
+            {activeZoomBotStatus && activeZoomBotStatus !== 'idle' && (
+              <div
+                className={cn(
+                  'mb-4 flex items-center justify-between rounded-xl border px-4 py-3 text-sm font-semibold',
+                  zoomBotIsActive
+                    ? 'border-blue-200 bg-blue-50 text-blue-800'
+                    : activeZoomBotStatus === 'completed'
+                    ? 'border-green-200 bg-green-50 text-green-800'
+                    : 'border-red-200 bg-red-50 text-red-800',
+                )}
+              >
+                <span className="flex items-center gap-2">
+                  {zoomBotIsActive && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Status: <span className="capitalize">{
+                    activeZoomBotStatus === 'waiting_admission' ? 'Waiting Room' : 
+                    activeZoomBotStatus === 'pre_join' ? 'Preparing' :
+                    activeZoomBotStatus === 'recording' ? 'Recording' :
+                    activeZoomBotStatus?.replace(/_/g, ' ')
+                  }</span>
+                </span>
+                {zoomBotIsActive && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="border-red-300 text-red-600 hover:bg-red-50"
+                    onClick={() => stopZoomBotMutation.mutate()}
+                    disabled={stopZoomBotMutation.isLoading}
+                  >
+                    <Square className="w-3 h-3 mr-1 fill-current" />
+                    Stop
+                  </Button>
+                )}
+              </div>
+            )}
+
+            {zoomLoading ? (
+              <div className="py-10 flex justify-center">
+                <Loader2 className="w-6 h-6 animate-spin text-slate-300" />
+              </div>
+            ) : upcomingZoomEvents.length === 0 ? (
+              <div className="py-12 text-center">
+                <div className="bg-slate-50 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <Video className="w-6 h-6 text-slate-300" />
+                </div>
+                <p className="text-sm text-slate-400 font-medium">
+                  {upcomingZoomData === undefined
+                    ? 'Connect Zoom.'
+                    : 'No Zoom events found.'}
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {upcomingZoomEvents.slice(0, 5).map((event: any, idx: number) => {
+                  const meetUrl: string = event.join_url || ''
+                  const title: string = event.topic || 'Untitled Zoom'
+                  const startRaw: string = event.start_time || ''
+                  const startDate = startRaw ? new Date(startRaw) : null
+                  const isJoiningThis = zoomJoiningUrl === meetUrl && joinZoomMutation.isLoading
+                  const isThisBotActive = zoomBotIsActive && zoomBotStatus?.zoom_url === meetUrl
+
+                  return (
+                    <div
+                      key={event.id || idx}
+                      className="flex items-center justify-between rounded-xl border border-slate-100 px-4 py-3 hover:bg-slate-50/50 transition-all"
+                    >
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-slate-900 truncate">{title}</p>
+                          {startDate && (
+                            <p className="text-[11px] text-slate-500 mt-0.5 font-medium flex items-center gap-1">
+                              <Clock className="w-3 h-3" />
+                              {startDate.toLocaleDateString()} {startDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-8 text-[11px] text-blue-600 font-bold"
+                          onClick={() => window.open(meetUrl, '_blank')}
+                          disabled={!meetUrl}
+                        >
+                          Open
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={!meetUrl || isJoiningThis || isThisBotActive}
+                          className={cn(
+                            'text-xs font-bold h-8 px-3',
+                            isThisBotActive
+                              ? 'bg-green-600 hover:bg-green-700'
+                              : 'bg-purple-600 hover:bg-purple-700',
+                          )}
+                          onClick={() => {
+                            if (!meetUrl) return
+                            joinZoomMutation.mutate({ zoomUrl: meetUrl, topic: title })
+                          }}
+                        >
+                          {isJoiningThis ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : isThisBotActive ? (
+                            'Joined'
+                          ) : (
+                            'Join'
+                          )}
+                        </Button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   )
 }

@@ -84,9 +84,9 @@ async def get_analytics_dashboard(
             or_(
                 Meeting.organizer_id == current_user.id,
                 Meeting.created_by == current_user.id,
-                cast(Meeting.attendee_ids, String).contains(str(current_user.id)),
-                cast(Meeting.attendee_ids, String).contains(current_user.email),
-                cast(Meeting.attendee_ids, String).contains(current_user.username),
+                cast(Meeting.attendee_ids, String).ilike(f"%{current_user.id}%"),
+                cast(Meeting.attendee_ids, String).ilike(f"%{current_user.email}%"),
+                cast(Meeting.attendee_ids, String).ilike(f"%{current_user.username}%"),
             )
         )
     meetings = db.execute(meeting_query).scalars().all()

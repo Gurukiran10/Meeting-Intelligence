@@ -438,7 +438,6 @@ export default function Integrations() {
   const [syncingId, setSyncingId] = useState<string | null>(null)
   const [historyImportingId, setHistoryImportingId] = useState<string | null>(null)
   const [zoomHistoryDaysBack, setZoomHistoryDaysBack] = useState<number>(30)
-  const [zoomBotJoiningUrl, setZoomBotJoiningUrl] = useState<string | null>(null)
   const [autoSyncRunning, setAutoSyncRunning] = useState(false)
   const [autoJoinRunning, setAutoJoinRunning] = useState(false)
   const [autoSyncSavingPlatform, setAutoSyncSavingPlatform] = useState<string | null>(null)
@@ -538,63 +537,9 @@ export default function Integrations() {
   const zoomConnected = integrations.find(i => i.id === 'zoom')?.connected
   const googleConnected = integrations.find(i => i.id === 'google')?.connected
 
-  const { data: zoomMeetings = [] } = useQuery(
-    'zoom-meetings',
-    () => api.get('/api/v1/integrations/zoom/meetings').then(r => r.data as {
-      id: string; topic: string; start_time: string; duration: number; join_url: string
-    }[]),
-    { enabled: !!zoomConnected },
-  )
-
-  const { data: googleMeetEvents = [], refetch: refetchGoogleMeet } = useQuery(
-    'google-meet-upcoming',
-    () => api.get('/api/v1/integrations/google/meet/upcoming', { params: { days_ahead: 30 } }).then(r => r.data as {
-      events: Array<{
-        id: string; summary: string; start: { dateTime?: string; date?: string };
-        end: { dateTime?: string; date?: string }; _meet_url: string;
-        attendees?: Array<{ email: string; displayName?: string }>
-      }>; count: number
-    }),
-    { enabled: !!googleConnected, select: d => d.events },
-  )
-
   const disconnectMutation = useMutation(
     (id: string) => api.delete(`/api/v1/integrations/${id}/disconnect`),
     { onSuccess: () => qc.invalidateQueries('integrations') },
-  )
-
-  // ── Meet bot join ─────────────────────────────────────────────────────────
-  const [joiningMeetUrl, setJoiningMeetUrl] = useState<string | null>(null)
-
-  const joinBotMutation = useMutation(
-    async (meetUrl: string) => {
-      console.log('[BOT] Integrations: Join Meet clicked —', meetUrl)
-      const res = await api.post('/api/v1/integrations/google/meet/join', {
-        meet_url: meetUrl,
-        stay_duration_seconds: 600,
-      })
-      console.log('[BOT] Integrations: API response', res.status, res.data)
-      return res.data
-    },
-    {
-      onMutate: (meetUrl) => {
-        setJoiningMeetUrl(meetUrl)
-        window.open(meetUrl, '_blank', 'noopener,noreferrer')
-      },
-      onSuccess: () => {
-        showIntegrationToast('Opened meeting tab · Bot is joining too…')
-      },
-      onError: (err: any) => {
-        const detail = err?.response?.data?.detail || err?.message || 'Failed to start bot'
-        console.error('[BOT] Integrations: join error', detail, err)
-        showIntegrationToast(`Error: ${detail}`, true)
-        setJoiningMeetUrl(null)
-      },
-      onSettled: () => {
-        // Keep joiningMeetUrl set so button shows loading until next render cycle
-        setTimeout(() => setJoiningMeetUrl(null), 3000)
-      },
-    },
   )
 
   const handleTest = (id: string) => {
@@ -636,10 +581,10 @@ export default function Integrations() {
       setSyncResult(s => ({ ...s, [id]: { msg, ok: true } }))
 
       if (id === 'zoom') {
-        qc.invalidateQueries('zoom-meetings')
+        qc.invalidateQueries('upcoming-zoom-meets')
       }
       if (id === 'google') {
-        qc.invalidateQueries('google-meet-upcoming')
+        qc.invalidateQueries('upcoming-google-meets')
       }
       qc.invalidateQueries('meetings')
     } catch (e: any) {
@@ -689,7 +634,8 @@ export default function Integrations() {
 
       await qc.refetchQueries('auto-sync-status')
       await qc.refetchQueries('meetings')
-      await qc.refetchQueries('zoom-meetings')
+      await qc.refetchQueries('upcoming-zoom-meets')
+      await qc.refetchQueries('upcoming-google-meets')
       await qc.refetchQueries('integrations')
     } finally {
       setAutoSyncRunning(false)
@@ -748,10 +694,11 @@ export default function Integrations() {
     }
   }
 
-  const connected = integrations.filter(i => i.connected)
-  const notConnected = integrations.filter(i => !i.connected)
+  const visibleIntegrations = integrations.filter(i => i.id !== 'microsoft')
+  const connected = visibleIntegrations.filter(i => i.connected)
+  const notConnected = visibleIntegrations.filter(i => !i.connected)
   const autoSyncPlatforms = connected
-    .filter(i => ['zoom', 'google', 'microsoft'].includes(i.id))
+    .filter(i => ['zoom', 'google'].includes(i.id))
     .map(i => i.id)
 
   return (
@@ -995,7 +942,7 @@ export default function Integrations() {
             <div className="text-sm text-gray-500 mt-1">Available</div>
           </div>
           <div className="bg-white rounded-xl border p-4 text-center">
-            <div className="text-3xl font-bold text-green-500">{integrations.length}</div>
+            <div className="text-3xl font-bold text-green-500">{visibleIntegrations.length}</div>
             <div className="text-sm text-gray-500 mt-1">Total</div>
           </div>
         </div>
@@ -1071,95 +1018,6 @@ export default function Integrations() {
                 </div>
               </div>
             )}
-            {/* Zoom upcoming meetings panel */}
-            {zoomConnected && zoomMeetings.length > 0 && (
-              <div>
-                <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">Upcoming Zoom Meetings</h2>
-                <div className="bg-white rounded-xl border divide-y">
-                  {zoomMeetings.map(m => (
-                    <div key={m.id} className="flex items-center justify-between px-5 py-3">
-                      <div>
-                        <p className="text-sm font-medium text-gray-900">{m.topic}</p>
-                        <p className="text-xs text-gray-500">{new Date(m.start_time).toLocaleString()} · {m.duration} min</p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={async () => {
-                            setZoomBotJoiningUrl(m.join_url)
-                            try {
-                              await api.post('/api/v1/integrations/zoom/bot/join', {
-                                zoom_url: m.join_url,
-                                stay_duration_seconds: m.duration * 60,
-                              })
-                              showIntegrationToast('Bot launched — joining your Zoom meeting now')
-                            } catch (e: any) {
-                              showIntegrationToast(e?.response?.data?.detail || 'Failed to launch bot', true)
-                            } finally {
-                              setTimeout(() => setZoomBotJoiningUrl(null), 3000)
-                            }
-                          }}
-                          disabled={zoomBotJoiningUrl === m.join_url}
-                          className="text-xs px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded-lg hover:bg-indigo-100 font-medium disabled:opacity-50"
-                        >
-                          {zoomBotJoiningUrl === m.join_url ? 'Launching…' : '🤖 Bot Join'}
-                        </button>
-                        <a
-                          href={m.join_url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-xs px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 font-medium"
-                        >
-                          Join
-                        </a>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Google Meet upcoming events panel */}
-            {googleConnected && googleMeetEvents.length > 0 && (
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Upcoming Google Meet Events</h2>
-                  <button
-                    onClick={() => refetchGoogleMeet()}
-                    className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-lg hover:bg-green-100 font-medium"
-                  >
-                    Refresh
-                  </button>
-                </div>
-                <div className="bg-white rounded-xl border divide-y">
-                  {googleMeetEvents.map(ev => {
-                    const startRaw = ev.start?.dateTime || ev.start?.date || ''
-                    const startDate = startRaw ? new Date(startRaw).toLocaleString() : '—'
-                    const attendeeCount = ev.attendees?.length ?? 0
-                    return (
-                      <div key={ev.id} className="flex items-center justify-between px-5 py-3">
-                        <div>
-                          <p className="text-sm font-medium text-gray-900">{ev.summary || 'Google Meet'}</p>
-                          <p className="text-xs text-gray-500">
-                            {startDate}{attendeeCount > 0 ? ` · ${attendeeCount} attendee${attendeeCount !== 1 ? 's' : ''}` : ''}
-                          </p>
-                        </div>
-                        <button
-                          disabled={!ev._meet_url || joiningMeetUrl === ev._meet_url || joinBotMutation.isLoading}
-                          onClick={() => {
-                            console.log('[BOT] Join Meet button clicked —', ev._meet_url)
-                            if (!ev._meet_url) return
-                            joinBotMutation.mutate(ev._meet_url)
-                          }}
-                          className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-lg hover:bg-green-100 font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
-                        >
-                          {joiningMeetUrl === ev._meet_url ? 'Starting…' : 'Join Meet'}
-                        </button>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
           </>
         )}
       </div>
@@ -1204,7 +1062,7 @@ interface CardProps {
 
 function IntegrationCard({ integration, testResult, syncResult, syncing, historyImporting, zoomHistoryDaysBack, onZoomHistoryDaysBackChange, onConnect, onDisconnect, onTest, onSync, onImportHistory }: CardProps) {
   const { id, name, type, description, connected, config } = integration
-  const canSync = id === 'zoom' || id === 'microsoft' || id === 'google'
+  const canSync = id === 'zoom' || id === 'google'
   const canImportHistory = id === 'zoom'
 
   return (

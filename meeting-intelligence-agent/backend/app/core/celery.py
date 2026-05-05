@@ -42,23 +42,24 @@ celery_app.conf.update(
         # DB-based auto-join scanner (no Google Calendar needed)
         "poll-db-auto-join": {
             "task": "poll_db_and_auto_join",
-            "schedule": settings.MEET_BOT_LEAD_TIME_MINUTES * 60,
+            "schedule": 30.0,
         },
         # Google Calendar-based auto-join (existing, kept for backward compat)
         "poll-calendar-auto-join": {
             "task": "poll_calendar_and_auto_join",
-            "schedule": 300.0,
+            "schedule": 30.0,
         },
         # Pre-meeting briefs
         "send-pre-meeting-briefs": {
             "task": "send_pre_meeting_briefs",
-            "schedule": 300.0,
+            "schedule": 60.0,
         },
         # Action item reminders
         "send-action-item-reminders": {
             "task": "send_action_item_reminders",
             "schedule": crontab(minute=0),
         },
+
         # Stuck meeting cleanup — every 5 minutes
         "cleanup-stuck-meetings": {
             "task": "cleanup_stuck_meetings",

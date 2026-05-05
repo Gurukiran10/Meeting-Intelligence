@@ -52,6 +52,7 @@ services:
     volumes:
       - ./backend:/app
       - ./uploads:/app/uploads
+      - recordings:/app/recordings
     depends_on:
       postgres:
         condition: service_healthy
@@ -81,6 +82,7 @@ services:
     volumes:
       - ./backend:/app
       - ./uploads:/app/uploads
+      - recordings:/app/recordings
     depends_on:
       - postgres
       - redis
@@ -94,7 +96,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: meeting-intel-celery-bots
-    command: celery -A app.core.celery:celery_app worker -Q bots --loglevel=info --concurrency=2
+    command: /entrypoint.sh celery -A app.core.celery:celery_app worker -Q bots --loglevel=info --concurrency=2
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_intel
       - REDIS_URL=redis://redis:6379/0
@@ -108,6 +110,7 @@ services:
       - ./backend:/app
       - ./uploads:/app/uploads
       - recordings:/app/recordings
+      - ./backend/entrypoint.sh:/entrypoint.sh
     depends_on:
       - postgres
       - redis

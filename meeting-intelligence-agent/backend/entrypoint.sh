@@ -18,7 +18,9 @@ fi
 
 # Start PulseAudio for audio capture (non-fatal if unavailable)
 if command -v pulseaudio &>/dev/null; then
-  pulseaudio --start --log-target=syslog 2>/dev/null || true
+  # Ensure root user can run pulseaudio (needs pulse-access group)
+  usermod -a -G audio,pulse,pulse-access root 2>/dev/null || true
+  pulseaudio -D --system --disallow-exit --disable-shm --exit-idle-time=-1 --log-target=syslog 2>/dev/null || true
 fi
 
 exec "$@"

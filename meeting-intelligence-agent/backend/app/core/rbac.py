@@ -118,6 +118,8 @@ def can_reprocess_meeting(user: User) -> bool:
     return has_permission(user, Permission.REPROCESS_MEETING)
 
 
+from sqlalchemy import cast, String
+
 def get_viewable_meetings(user: User, db: Session) -> List[Meeting]:
     """Get all meetings a user can view"""
     if not user or not user.is_active:
@@ -130,9 +132,9 @@ def get_viewable_meetings(user: User, db: Session) -> List[Meeting]:
     # Regular users see: meetings they organized + meetings they attended
     user_id_str = str(user.id)
     meetings = db.query(Meeting).filter(
+        Meeting.deleted_at.is_(None),
         (Meeting.organizer_id == user.id) |
-        (Meeting.attendee_ids.contains(user_id_str)) |
-        (Meeting.deleted_at.is_(None))
+        cast(Meeting.attendee_ids, String).ilike(f"%{user_id_str}%")
     ).all()
     
     return meetings

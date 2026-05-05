@@ -36,6 +36,18 @@ from app.models.meeting import Meeting
 
 logger = logging.getLogger(__name__)
 
+
+def _bot_print_safe(msg: str) -> None:
+    """Force output to stdout so it appears in docker-compose logs immediately."""
+    import sys
+    from datetime import datetime as _dt
+    timestamp = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    full_msg = f"[BOT-AUTO] [{timestamp}] {msg}"
+    sys.stdout.write(full_msg + "\n")
+    sys.stdout.flush()
+    logger.info(full_msg)
+
+
 MAX_HOST_WAIT_RETRIES   = 5     # how many times to retry if host hasn't started
 HOST_WAIT_RETRY_DELAY_S = 30    # seconds to wait between host-wait retries
 MIN_SESSION_SECONDS     = 30    # recordings shorter than this = bot was alone, not a real meeting
@@ -93,6 +105,7 @@ async def _run_bot_with_host_retry(
         "[AutoJoin] attempt=%d/%d  meeting=%s  platform=%s  url=%s",
         attempt, MAX_HOST_WAIT_RETRIES, meeting_id, platform, meet_url,
     )
+    _bot_print_safe(f"[AutoJoin] ▶ Starting bot session  meeting={meeting_id}  platform={platform}  url={meet_url}  attempt={attempt}/{MAX_HOST_WAIT_RETRIES}")
 
     await set_rich_state(
         meeting_id, BotStatus.LAUNCHING,
@@ -110,8 +123,8 @@ async def _run_bot_with_host_retry(
 
     try:
         if platform == "zoom":
-            from app.services.zoom_bot import join_zoom_meeting
-            await join_zoom_meeting(
+            from app.services.zoom_bot import _run_zoom_session
+            await _run_zoom_session(
                 zoom_url=meet_url,
                 user_id=user_id,
                 organization_id=organization_id,

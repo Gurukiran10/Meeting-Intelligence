@@ -93,9 +93,19 @@ _HEADLESS = os.getenv("MEET_BOT_HEADLESS", "1") != "0"
 
 
 def _bot_print(msg: str) -> None:
-    """Print + log together so the message appears in both docker logs and structured logs."""
-    print(msg, flush=True)
-    logger.info(msg)
+    """Force output to stdout so it appears in docker-compose logs immediately."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    full_msg = f"\n[MEET-BOT] [{timestamp}] {msg}\n"
+    # Use sys.stdout.write + flush for maximum reliability
+    import sys
+    sys.stdout.write(full_msg)
+    sys.stdout.flush()
+    logger.info(full_msg)
+    try:
+        with open("/tmp/meet_bot.log", "a") as f:
+            f.write(full_msg + "\n")
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -111,14 +121,16 @@ def _bot_print(msg: str) -> None:
 # Button text visible in the screenshot: "Allow microphone and camera"
 # This card appears for signed-in users on the pre-join screen.
 _MEDIA_CONSENT_CARD: List[str] = [
-    # Exact match first — most reliable
     'button:has-text("Allow microphone and camera")',
-    # Fallback: broader substring — catches locale variants
     'button:has-text("Allow microphone")',
     'button:has-text("Allow camera")',
-    # Dialog-level dismissal attributes
-    '[data-mdc-dialog-action="accept"]',
+    'button:has-text("Got it")',
+    'button:has-text("Dismiss")',
+    'button:has-text("Continue without")',
     '[jsname="IbE0S"]',
+    '[data-mdc-dialog-action="accept"]',
+    '[aria-label="Allow access"]',
+    '[aria-label*="Allow" i]',
 ]
 
 # Signals that confirm the media-consent card is GONE.
@@ -170,19 +182,34 @@ _NAME_INPUT: List[str] = [
 ]
 
 # Join buttons — ordered by specificity
-_JOIN_BUTTON_TEXTS = ["Join now", "Ask to join", "Continue without microphone", "Continue without camera", "Join"]
+_JOIN_BUTTON_TEXTS = [
+    "Join now",
+    "Ask to join",
+    "Join meeting",
+    "Join",
+    "Continue without microphone",
+    "Continue without camera",
+    "Continue without audio",
+    "Ready to join",
+]
 _JOIN_BUTTONS_BY_JSNAME: List[str] = [
     'button[jsname="Qx7uuf"]',          # "Join now"
     'button[jsname="CwaK9"]',           # "Ask to join"
+    'button[jsname="j97Atc"]',          # "Join" fallback
+    'button[jsname="V67SHe"]',          # "Continue without microphone" variant
 ]
 
 # In-meeting confirmation signals
 _IN_MEETING: List[str] = [
     '[aria-label*="Leave call"]',
+    '[aria-label*="Leave meeting"]',
     '[data-tooltip*="Leave call"]',
     'button:has-text("Leave call")',
-    '[data-allocation-index]',          # participant tile
+    '[aria-label*="Show everyone"]',
+    '[aria-label*="Chat with everyone"]',
     '[jscontroller="ynJ3Fb"]',          # meeting controls bar
+    '[data-allocation-index]',          # participant tile
+    '[jsname="NakZHc"]',                # More options button (only in-meeting)
 ]
 
 # Leave buttons
@@ -195,6 +222,17 @@ _LEAVE_CONFIRM: List[str] = [
     'button:has-text("Leave meeting")',
     'button:has-text("Leave")',
     '[aria-label*="Leave meeting"]',
+]
+
+# Waiting signals — text selectors use :has-text() which is a substring match
+_WAITING_FOR_HOST: List[str] = [
+    ':has-text("Waiting for the host")',
+    ':has-text("will let you in soon")',
+    ':has-text("Asking to join")',
+    'button:has-text("Asking to join")',
+    '[jsname="Z9G66"]',   # Waiting room indicator
+    ':has-text("Your request to join")',
+    ':has-text("waiting to let you in")',
 ]
 
 
@@ -261,7 +299,7 @@ def _db_upsert_meeting_sync(user_id: str, organization_id: str, meet_url: str, t
         existing = db.execute(
             select(Meeting).where(
                 Meeting.organizer_id == user_id,
-                Meeting.meeting_url == meet_url,
+                Meeting.meeting_url.startswith(meet_url),
                 Meeting.deleted_at.is_(None),
             )
         ).scalar_one_or_none()
@@ -542,6 +580,8 @@ async def _wait_for_prejoin_screen(page: Any, user_id: str) -> bool:
         ('button[jsname="CwaK9"]',         "ASK_TO_JOIN"),
         ('button:has-text("Join now")',     "JOIN_NOW"),
         ('button[jsname="Qx7uuf"]',        "JOIN_NOW"),
+        ('button:has-text("Join meeting")', "JOIN_MEETING"),
+        ('button:has-text("Continue without")', "CONTINUE_WITHOUT"),
         ('[jsname="BOHaEe"]',              "MIC_TOGGLE"),
         ('[jsname="R3Gied"]',              "CAM_TOGGLE"),
     ]
@@ -987,7 +1027,8 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
                 for (const b of buttons) {
                     const text  = (b.innerText  || b.textContent || '').toLowerCase();
                     const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                    if (text.includes('join') || text.includes('ask') || label.includes('join')) {
+                    const candidates = ['join', 'ask', 'ready', 'continue without'];
+                    if (candidates.some(c => text.includes(c) || label.includes(c))) {
                         b.dispatchEvent(new MouseEvent('click', {
                             bubbles: true, cancelable: true, view: window
                         }));
@@ -1000,9 +1041,9 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
             _bot_print(f"[BOT] JS click error: {exc}")
             return False
 
-    # ── 5 s initial wait — Meet's React UI finishes async state updates ───────
-    _bot_print(f"[BOT] _click_join: 5 s stabilisation wait — user={user_id}")
-    await page.wait_for_timeout(5_000)
+    # ── 1 s initial wait — Meet's React UI finishes async state updates ───────
+    _bot_print(f"[BOT] _click_join: 1 s stabilisation wait — user={user_id}")
+    await page.wait_for_timeout(1_000)
 
     _MAX_ATTEMPTS = 15  # up to ~5 min waiting for host to let bot in
     for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -1055,40 +1096,20 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
                 f"[BOT WARNING] Post-join 'can't join' screen detected "
                 f"on attempt {attempt}/{_MAX_ATTEMPTS} — jsnames={page_jsnames & _CANT_JOIN_JSNAMES}"
             )
+            # If we are actually in the meeting despite the error screen (sometimes happens), return True
+            if await _wait_in_meeting_quick(page):
+                _bot_print("[BOT] ✓ Actually in meeting despite error screen!")
+                return True
+
             _bot_print(
                 "[BOT] Host may not be in the meeting yet. "
-                "Waiting 8 s then retrying…"
+                "Waiting 3 s then retrying…"
             )
             await _ss(f"cant_join_postclick_a{attempt}")
-            if attempt < _MAX_ATTEMPTS:
-                await asyncio.sleep(8)
-                # Navigate fresh (about:blank → meet URL) to clear cached block
-                saved_url = page.url
-                try:
-                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=5_000)
-                except Exception:
-                    pass
-                try:
-                    await page.goto(saved_url, wait_until="domcontentloaded", timeout=35_000)
-                    _bot_print(f"[BOT] Fresh navigation done for post-join retry — URL={page.url}")
-                except Exception as exc:
-                    _bot_print(f"[BOT] Navigation failed (non-fatal): {exc}")
-                prejoin_ok = await _wait_for_prejoin_screen(page, user_id)
-                if prejoin_ok:
-                    _bot_print("[BOT] Pre-join screen restored after reload")
-                    if bot_name:
-                        await _enter_name(page, bot_name, user_id)
-                        await asyncio.sleep(0.6)
-                    await _disable_mic(page, user_id)
-                    await asyncio.sleep(0.3)
-                    await _disable_camera(page, user_id)
-                    await asyncio.sleep(0.3)
-                    await _dismiss_media_popup(page, user_id)
-                    await _wait_join_enabled(page, user_id)
-                else:
-                    _bot_print("[BOT WARNING] Pre-join did not render after reload — continuing anyway")
+            await page.wait_for_timeout(3_000)
+            # Fresh navigation on block (helps clear "Can't join" state)
+            await page.goto(page.url, wait_until="domcontentloaded")
             continue
-
         # Screenshot BEFORE clicking
         await _ss(f"before_click_{attempt}")
 
@@ -1107,11 +1128,14 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
         # ── Strategy B: "Ask to join" ─────────────────────────────────────────
         if not joined:
             try:
-                loc = page.locator('button:has-text("Ask to join")')
-                if await loc.count() > 0:
-                    _bot_print("[BOT] Strategy B — clicking 'Ask to join' (force=True)")
-                    await loc.first.click(force=True, timeout=5_000)
-                    joined = True
+                # Try "Ask to join" and "Join meeting"
+                for txt in ["Ask to join", "Join meeting"]:
+                    loc = page.locator(f'button:has-text("{txt}")')
+                    if await loc.count() > 0:
+                        _bot_print(f"[BOT] Strategy B — clicking '{txt}' (force=True)")
+                        await loc.first.click(force=True, timeout=5_000)
+                        joined = True
+                        break
             except Exception as exc:
                 _bot_print(f"[BOT] Strategy B failed: {exc}")
 
@@ -1164,6 +1188,15 @@ async def _click_join(page: Any, user_id: str, bot_name: str = "") -> bool:
             if await _wait_in_meeting_quick(page):
                 _bot_print(f"[BOT] ✓ JOINED — in-meeting signals confirmed")
                 return True
+
+            # CHECK FOR WAITING ROOM — if we are waiting for host, the click was successful
+            for wait_sel in _WAITING_FOR_HOST:
+                try:
+                    if await page.locator(wait_sel).first.is_visible(timeout=500):
+                        _bot_print(f"[BOT] ✓ SUCCESS — in waiting room via '{wait_sel}'")
+                        return True
+                except Exception:
+                    continue
 
             _bot_print(f"[BOT] Click fired but join not yet confirmed — will retry")
         else:
@@ -1344,12 +1377,13 @@ _WEBRTC_INTERCEPT = """
     // transmitted to meeting participants. track.enabled=false silences the
     // MediaStreamTrack at the source; the connection still negotiates normally
     // so WebRTC doesn't detect the bot as "no audio" and drop the channel.
+    // NOTE: we only disable LOCAL tracks here (isRemote=false). Remote tracks
+    // (other participants) come through ontrack and are NEVER disabled.
     const _origAddTrack = RTCPeerConnection.prototype.addTrack;
     RTCPeerConnection.prototype.addTrack = function(track) {
         if (track.kind === 'audio') {
-            track.enabled = false;
+            _capture(track, false);
         }
-        _capture(track, false);
         return _origAddTrack.apply(this, arguments);
     };
 
@@ -1397,17 +1431,31 @@ async def _run_session(
     recordings_dir: str,
 ) -> None:
     """Full bot lifecycle. Up to MAX_RETRIES attempts. Never raises."""
+    if user_id not in _active_bots:
+        _active_bots[user_id] = {
+            "status": "pending",
+            "bot_display_name": bot_display_name,
+            "stay_duration_seconds": stay_duration_seconds,
+            "recordings_dir": recordings_dir,
+            "recording_path": None,
+            "alone_whole_time": False,
+            "error": None,
+            "_task": None,
+            "meeting_id": meeting_id,
+        }
+
     _bot_print(f"[BOT] _run_session STARTED — user={user_id} meeting={meeting_id} url={meet_url}")
 
-    from playwright.async_api import async_playwright
     from app.services.recording_service import (
         RecordingSession,
         get_pulse_sink_env,
+        prepare_audio_sink,
         start_recording,
         start_playwright_recording,
         stop_recording,
+        stop_ffmpeg_recording,
     )
-    from app.tasks.meeting_processor import process_meeting_recording_background
+    from app.tasks.meeting_processor import process_meeting_recording
 
     _bot_print(f"[BOT] All imports OK — headless={_HEADLESS}")
     last_error: Optional[str] = None
@@ -1416,39 +1464,50 @@ async def _run_session(
         _bot_print(f"[BOT] Attempt {attempt}/{MAX_RETRIES} — user={user_id} url={meet_url}")
 
         rec_session: Optional[RecordingSession] = None
+        _ffmpeg_rec: Optional[RecordingSession] = None
         browser = None
 
         try:
-            # ── Step 1: Start ffmpeg recording before browser (PulseAudio sink must exist) ──
-            _bot_print(f"[BOT] Step 1: starting audio recording (meeting={meeting_id})")
-            try:
-                rec_session = await start_recording(meeting_id, output_dir=recordings_dir)
-            except Exception as rec_exc:
-                _bot_print(f"[BOT] Step 1: recording start failed (non-fatal) — {rec_exc}")
-                rec_session = None
-            pulse_env = get_pulse_sink_env(rec_session)
-            _bot_print(f"[BOT] Step 1 done: rec_session={'ffmpeg' if rec_session else 'None — will use Playwright recorder after join'}")
+            _bot_print(">>> HYPER-FAST STARTUP <<<")
+            
+            # ── Pre-Step: Prepare audio sink (very fast) ──────────────────────
+            sink_name, sink_mod = await prepare_audio_sink(meeting_id)
+            pulse_env = {"PULSE_SINK": sink_name} if sink_name else {}
 
-            # ── Step 2: Launch Chromium ────────────────────────────────────────
-            _bot_print(f"[BOT] Step 2: launching Chromium headless={_HEADLESS}")
+            # ── Step 1: Launch Chromium IMMEDIATELY ───────────────────────────
+            _bot_print(f"Step 1: Launching Chromium (sink={sink_name})")
+            from playwright.async_api import async_playwright
             async with async_playwright() as pw:
-                chromium_env = {**os.environ, **pulse_env}
-
-                chromium_args = _CHROMIUM_ARGS.copy()
-                if _HEADLESS:
-                    chromium_args.append("--use-fake-device-for-media-stream")
-
                 try:
-                    browser = await pw.chromium.launch(
-                        headless=_HEADLESS,
-                        env=chromium_env,
-                        args=chromium_args,
+                    browser = await asyncio.wait_for(
+                        pw.chromium.launch(
+                            headless=_HEADLESS,
+                            env={**os.environ, **pulse_env},
+                            args=_CHROMIUM_ARGS + (["--use-fake-device-for-media-stream"] if _HEADLESS else []),
+                        ),
+                        timeout=20
                     )
                 except Exception as launch_exc:
-                    _bot_print(f"[BOT ERROR] Browser launch failed: {launch_exc}")
+                    _bot_print(f"CRITICAL: Browser launch failed: {launch_exc}")
                     raise
 
-                _bot_print(f"[BOT] Step 2 done: Chromium launched")
+                _bot_print("Step 1 done: Browser launched")
+
+                # ── Step 2: Start audio recording (non-blocking) ──────────────
+                _bot_print("Step 2: starting recording...")
+                try:
+                    rec_session = await start_recording(
+                        meeting_id, 
+                        output_dir=recordings_dir,
+                        precreated_sink_name=sink_name,
+                        precreated_module_id=sink_mod
+                    )
+                except Exception as rec_exc:
+                    _bot_print(f"Step 2: recording failed (non-fatal) — {rec_exc}")
+                    rec_session = None
+                _ffmpeg_rec = rec_session  # save ffmpeg ref — may be replaced by Playwright below
+
+                _bot_print("Step 2 done: recording initialized")
 
                 # storage_state=None + clear_cookies() guarantees the bot joins
                 # as a GUEST ("SyncMinds Bot") rather than as the logged-in user.
@@ -1485,6 +1544,21 @@ async def _run_session(
                 await page.add_init_script(_WEBRTC_INTERCEPT)
 
                 # ── Step 3: Navigate ──────────────────────────────────────────
+                # Initialize _active_bots entry here (not just at top of function)
+                # so that if we crash between browser launch and here, status
+                # updates don't raise KeyError.
+                if user_id not in _active_bots:
+                    _active_bots[user_id] = {
+                        "status": "pending",
+                        "bot_display_name": bot_display_name,
+                        "stay_duration_seconds": stay_duration_seconds,
+                        "recordings_dir": recordings_dir,
+                        "recording_path": None,
+                        "alone_whole_time": False,
+                        "error": None,
+                        "_task": None,
+                        "meeting_id": meeting_id,
+                    }
                 _active_bots[user_id]["status"] = "navigating"
                 _bot_print(f"[BOT] Step 3: navigating to {meet_url}")
 
@@ -1536,62 +1610,91 @@ async def _run_session(
                 if not ready:
                     raise RuntimeError("Pre-join screen did not render within timeout")
 
-                _bot_print(f"[BOT] Step 5 done: pre-join screen ready")
+                # FAST TRACK: only skip the join flow if the Leave-call button is
+                # definitively visible — that is the ONLY signal that cannot appear
+                # on the pre-join screen. Other _IN_MEETING selectors (e.g. jsname
+                # NakZHc "More options") also appear on the pre-join screen and
+                # would give a false positive here.
+                try:
+                    _leave_visible = await page.locator('[aria-label*="Leave call" i]').first.is_visible(timeout=1_000)
+                except Exception:
+                    _leave_visible = False
 
-                # ── Step 5b: CRITICAL — dismiss media consent card ────────────
-                _bot_print(f"[BOT] Step 5b: checking for media consent card (signed-in flow)")
-                await _handle_permissions(context, page, user_id)
-                await _screenshot(page, "02b_after_consent", user_id)
-
-                # ── Step 6: Enter guest name ──────────────────────────────────
-                # Since we cleared cookies, Meet should show the guest pre-join
-                # with a "Your name" input. Fill it with bot_display_name so the
-                # bot appears as "SyncMinds Bot" (or configured name) in the call.
-                _bot_print(f"[BOT] Step 6: entering guest name '{bot_display_name}'")
-                name_entered = await _enter_name(page, bot_display_name, user_id)
-                if name_entered:
-                    _bot_print(f"[BOT] Step 6 done: guest name entered — bot identity confirmed")
-                    await _screenshot(page, "02c_name_entered", user_id)
-                    await asyncio.sleep(0.6)
+                if _leave_visible:
+                    _bot_print("[BOT] FAST TRACK: Leave call button visible — already in meeting, skipping pre-join flow")
+                    in_meeting = True
+                    status = "in_meeting"
+                    _active_bots[user_id]["status"] = status
                 else:
-                    _bot_print(f"[BOT] Step 6: name field not found — proceeding (may be signed-in flow)")
-                    await _screenshot(page, "02c_name_failed", user_id)
+                    _bot_print(f"[BOT] Step 5 done: pre-join screen ready — proceeding with join flow")
 
-                # ── Step 7: Wait for join button to be ENABLED ────────────────
-                _bot_print(f"[BOT] Step 7: waiting for join button to become enabled")
-                await _wait_join_enabled(page, user_id)
-                await _screenshot(page, "03_ready_to_join", user_id)
+                    # ── Step 5b: CRITICAL — dismiss media consent card ────────────
+                    _bot_print(f"[BOT] Step 5b: checking for media consent card (signed-in flow)")
+                    await _handle_permissions(context, page, user_id)
+                    await _screenshot(page, "02b_after_consent", user_id)
 
-                # ── Step 8: Disable mic and camera ────────────────────────────
-                _bot_print(f"[BOT] Step 8: disabling mic and camera")
-                await _disable_mic(page, user_id)
-                await asyncio.sleep(0.3)
-                await _disable_camera(page, user_id)
-                await asyncio.sleep(0.3)
-                await _screenshot(page, "04_media_off", user_id)
+                    # ── Step 6: Enter guest name ──────────────────────────────────
+                    # Since we cleared cookies, Meet should show the guest pre-join
+                    # with a "Your name" input. Fill it with bot_display_name so the
+                    # bot appears as "SyncMinds Bot" (or configured name) in the call.
+                    _bot_print(f"[BOT] Step 6: entering guest name '{bot_display_name}'")
+                    name_entered = await _enter_name(page, bot_display_name, user_id)
+                    if name_entered:
+                        _bot_print(f"[BOT] Step 6 done: guest name entered — bot identity confirmed")
+                        await _screenshot(page, "02c_name_entered", user_id)
+                        await asyncio.sleep(0.6)
+                    else:
+                        _bot_print(f"[BOT] Step 6: name field not found — proceeding (may be signed-in flow)")
+                        await _screenshot(page, "02c_name_failed", user_id)
 
-                # ── Step 8b: Final sweep for media consent card ───────────────
-                await _dismiss_media_popup(page, user_id)
-                await _wait_media_card_gone(page, user_id, timeout_s=3.0)
+                    # ── Step 7: Wait for join button to be ENABLED ────────────────
+                    _bot_print(f"[BOT] Step 7: waiting for join button to become enabled")
+                    await _wait_join_enabled(page, user_id)
+                    await _screenshot(page, "03_ready_to_join", user_id)
 
-                # ── Step 9: Click join ────────────────────────────────────────
-                _active_bots[user_id]["status"] = "joining"
-                _bot_print(f"[BOT] Step 9: clicking join button")
-                joined_click = await _click_join(page, user_id, bot_name=bot_display_name)
-                if not joined_click:
-                    await _screenshot(page, "05_join_failed", user_id)
-                    raise RuntimeError("Could not find or click any join button")
+                    # ── Step 8: Disable mic and camera ────────────────────────────
+                    _bot_print(f"[BOT] Step 8: disabling mic and camera")
+                    await _disable_mic(page, user_id)
+                    await asyncio.sleep(0.3)
+                    await _disable_camera(page, user_id)
+                    await asyncio.sleep(0.3)
+                    await _screenshot(page, "04_media_off", user_id)
 
-                _bot_print(f"[BOT] Step 9 done: join button clicked")
-                await _screenshot(page, "05_join_clicked", user_id)
+                    # ── Step 8b: Final sweep for media consent card ───────────────
+                    await _dismiss_media_popup(page, user_id)
+                    await _wait_media_card_gone(page, user_id, timeout_s=3.0)
 
-                # ── Step 10: Confirm in-meeting ───────────────────────────────
-                _bot_print(f"[BOT] Step 10: confirming we are in the meeting")
-                in_meeting = await _wait_in_meeting(page, user_id)
-                status = "in_meeting" if in_meeting else "waiting_admission"
-                _active_bots[user_id]["status"] = status
-                await _screenshot(page, "06_in_meeting" if in_meeting else "06_waiting_room", user_id)
-                _bot_print(f"[BOT] Step 10 done: status={status} — staying {stay_duration_seconds}s")
+                    # ── Step 9: Click join ────────────────────────────────────────
+                    _active_bots[user_id]["status"] = "joining"
+                    _bot_print(f"[BOT] Step 9: clicking join button")
+                    joined_click = await _click_join(page, user_id, bot_name=bot_display_name)
+                    if not joined_click:
+                        await _screenshot(page, "05_join_failed", user_id)
+                        raise RuntimeError("Could not find or click any join button")
+
+                    _bot_print(f"[BOT] Step 9 done: join button clicked")
+                    await _screenshot(page, "05_join_clicked", user_id)
+
+                    # ── Step 10: Confirm in-meeting ───────────────────────────────
+                    _bot_print(f"[BOT] Step 10: confirming we are in the meeting")
+                    in_meeting = await _wait_in_meeting(page, user_id)
+
+                    # Check for waiting room signals if not confirmed in_meeting
+                    is_waiting = False
+                    if not in_meeting:
+                        for sel in _WAITING_FOR_HOST:
+                            try:
+                                if await page.locator(sel).first.is_visible(timeout=2_000):
+                                    is_waiting = True
+                                    _bot_print(f"[BOT] detected waiting room state via '{sel}'")
+                                    break
+                            except Exception:
+                                continue
+
+                    status = "in_meeting" if in_meeting else ("waiting_admission" if is_waiting else "joining")
+                    _active_bots[user_id]["status"] = status
+                    await _screenshot(page, "06_in_meeting" if in_meeting else ("06_waiting_room" if is_waiting else "06_join_retry"), user_id)
+                    _bot_print(f"[BOT] Step 10 done: status={status} — staying {stay_duration_seconds}s")
 
                 # ── Step 10b: Send recording consent announcement in chat ──────
                 if in_meeting:
@@ -1609,18 +1712,22 @@ async def _run_session(
                     except Exception as _chat_err:
                         _bot_print(f"[BOT] Step 10b: chat error (non-fatal): {_chat_err}")
 
-                # ── Step 11: Start in-page recording if ffmpeg unavailable ────
-                if rec_session is None:
-                    _bot_print(f"[BOT] Step 11: starting Playwright MediaRecorder (ffmpeg unavailable)")
+                # ── Step 11: Always start Playwright recording when in_meeting ─────────
+                # Playwright directly intercepts RTCPeerConnection tracks → captures
+                # participant audio even when PulseAudio routing is unreliable.
+                # We run both ffmpeg + Playwright in parallel and prefer Playwright's output.
+                if in_meeting:
+                    _bot_print(f"[BOT] Step 11: starting Playwright MediaRecorder (WebRTC direct capture)")
                     await asyncio.sleep(2)
-                    rec_session = await start_playwright_recording(
+                    _pw_session = await start_playwright_recording(
                         page=page,
                         meeting_id=meeting_id,
                         output_dir=recordings_dir,
                     )
-                    if rec_session:
-                        _bot_print(f"[BOT] Step 11 done: Playwright recording started")
-                    else:
+                    if _pw_session:
+                        _bot_print(f"[BOT] Step 11 done: Playwright WebRTC recording active — using as primary")
+                        rec_session = _pw_session  # Playwright is primary; ffmpeg runs as backup
+                    elif rec_session is None:
                         _bot_print(f"[BOT WARNING] Step 11: no recording available for this session")
 
                 # ── Step 11b: Build attendee context + start live pipeline ──────
@@ -1682,6 +1789,7 @@ async def _run_session(
                 consecutive_gone = 0   # Leave button disappeared
                 alone_since: Optional[float] = None  # timestamp when bot became last participant
                 ALONE_GRACE = 120      # seconds to wait after going alone before leaving
+                was_ever_admitted = in_meeting  # True if bot was in meeting when Step 12 starts
 
                 while elapsed < stay_duration_seconds:
                     await asyncio.sleep(poll_interval)
@@ -1692,21 +1800,41 @@ async def _run_session(
                         leave_btn = page.locator('[aria-label*="Leave call" i]').first
                         visible = await leave_btn.is_visible(timeout=2_000)
                         if not visible:
+                            if not in_meeting:
+                                # Bot is still in waiting room — Leave button is hidden here.
+                                # This is NORMAL; do NOT count as consecutive_gone.
+                                # Keep waiting patiently for the host to admit us.
+                                _active_bots[user_id]["status"] = "waiting_admission"
+                                consecutive_gone = 0
+                                _bot_print(f"[BOT] Step 12: waiting for host admission at {elapsed}s")
+                            else:
+                                # Bot was admitted but Leave button is now gone → meeting ended.
+                                consecutive_gone += 1
+                                if consecutive_gone >= 4:
+                                    _bot_print(
+                                        f"[BOT] Step 12: meeting page ended (Leave button gone after {elapsed}s)"
+                                    )
+                                    break
+                        else:
+                            consecutive_gone = 0
+                            if not in_meeting:
+                                in_meeting = True
+                                was_ever_admitted = True
+                                _active_bots[user_id]["status"] = "in_meeting"
+                                _bot_print("[BOT] Admitted from waiting room!")
+
+                    except Exception:
+                        if in_meeting:
                             consecutive_gone += 1
-                            if consecutive_gone >= 2:
+                            if consecutive_gone >= 4:
                                 _bot_print(
-                                    f"[BOT] Step 12: meeting page ended (Leave button gone after {elapsed}s)"
+                                    f"[BOT] Step 12: meeting likely ended (Leave button error after {elapsed}s)"
                                 )
                                 break
                         else:
+                            # Still waiting for admission — don't exit on transient errors
+                            _bot_print(f"[BOT] Step 12: transient error in waiting room at {elapsed}s, continuing...")
                             consecutive_gone = 0
-                    except Exception:
-                        consecutive_gone += 1
-                        if consecutive_gone >= 2:
-                            _bot_print(
-                                f"[BOT] Step 12: meeting likely ended (Leave button error after {elapsed}s)"
-                            )
-                            break
 
                     # ── Check 2: is the bot the only participant? ───────────
                     # Participants leave without "ending for all" → Leave button
@@ -1725,7 +1853,11 @@ async def _run_session(
                                     const lbl = btn.getAttribute('aria-label') || '';
                                     if (/participant|people|everyone/i.test(lbl)) {
                                         const m = lbl.match(/\\((\d+)\\)/);
-                                        if (m && parseInt(m[1]) <= 1) return true;
+                                        if (m) {
+                                            const count = parseInt(m[1]);
+                                            if (count <= 1) return true;
+                                            if (count > 1) return false;
+                                        }
                                     }
                                 }
 
@@ -1735,7 +1867,7 @@ async def _run_session(
                                 // video element count which gives false "alone" positives).
                                 const tiles = document.querySelectorAll('[data-participant-id]');
                                 if (tiles.length > 1) return false;   // multiple tiles = not alone
-                                if (tiles.length === 1) return true;  // only bot's own tile
+                                if (tiles.length === 1) return false; // bot sends no video, so 1 tile = someone else
                                 // tiles.length === 0 → headless: can't tell, assume not alone
                                 return false;
                             }
@@ -1767,20 +1899,32 @@ async def _run_session(
                         _bot_print(f"[BOT WARNING] Step 12b: LivePipeline stop error (non-fatal): {_lp_stop_err}")
                     live_pipeline = None
 
-                # Was the bot alone for the entire session (host never joined)?
-                # alone_since is set when the bot first detected it was alone.
-                # If alone_since == 0 (set from the start) or set right after joining,
-                # it means the host simply wasn't there.
+                # alone_whole_time: ONLY discard the recording if the bot was NEVER
+                # admitted into the meeting at all (host never showed up / waiting room
+                # timeout). If the bot was actually in the call (was_ever_admitted=True)
+                # keep the recording even if everyone eventually left — the user may
+                # have been speaking before others dropped off.
                 alone_whole_time = (
-                    alone_since is not None
-                    and (elapsed - alone_since) >= ALONE_GRACE
-                    and alone_since < (ALONE_GRACE + poll_interval * 2)
+                    not was_ever_admitted  # bot was never let in at all
+                    or (
+                        alone_since is not None
+                        and (elapsed - alone_since) >= ALONE_GRACE
+                        and alone_since < (ALONE_GRACE + poll_interval * 2)  # alone from the very start
+                        and not was_ever_admitted  # never actually in a meeting
+                    )
                 )
                 _active_bots[user_id]["alone_whole_time"] = alone_whole_time
 
                 # ── Step 13: Stop recording ───────────────────────────────────
                 _bot_print(f"[BOT] Step 13: stopping recording")
                 _active_bots[user_id]["status"] = "stopping_recording"
+                # Flush ffmpeg backup session if Playwright is primary
+                if _ffmpeg_rec is not None and rec_session is not _ffmpeg_rec:
+                    try:
+                        await stop_ffmpeg_recording(_ffmpeg_rec)
+                        _bot_print("[BOT] Step 13: ffmpeg backup session flushed")
+                    except Exception as _fe:
+                        _bot_print(f"[BOT] Step 13: ffmpeg flush error (non-fatal): {_fe}")
                 recording_path = await stop_recording(rec_session, page=page)
                 rec_session = None
 
@@ -1811,7 +1955,7 @@ async def _run_session(
                         None, _db_save_recording_path_sync, meeting_id, path_str
                     )
                     _bot_print(f"[BOT] dispatching transcription for meeting={meeting_id}")
-                    process_meeting_recording_background(meeting_id, path_str)
+                    process_meeting_recording.delay(meeting_id, path_str)
                 else:
                     _bot_print(f"[BOT WARNING] no recording file — skipping transcription")
 
@@ -1843,6 +1987,12 @@ async def _run_session(
                 pass
             # Try to save whatever audio was captured before the task was killed
             try:
+                # Flush ffmpeg backup if Playwright was primary
+                if _ffmpeg_rec is not None and rec_session is not _ffmpeg_rec:
+                    try:
+                        await stop_ffmpeg_recording(_ffmpeg_rec)
+                    except Exception:
+                        pass
                 if rec_session:
                     saved_path = await stop_recording(rec_session, page=page)
                     if saved_path and saved_path.exists():
@@ -1852,7 +2002,7 @@ async def _run_session(
                         await loop.run_in_executor(
                             None, _db_save_recording_path_sync, meeting_id, path_str
                         )
-                        process_meeting_recording_background(meeting_id, path_str)
+                        process_meeting_recording.delay(meeting_id, path_str)
                     else:
                         _bot_print(f"[BOT] Cancellation: no recording to save")
             except Exception as _cancel_save_err:
@@ -1872,8 +2022,31 @@ async def _run_session(
                          user_id, attempt, exc, exc_info=True)
             _active_bots[user_id]["status"] = f"error_attempt_{attempt}"
 
+            # ── SAFETY NET: Try to rescue recording even on crash ──────────
+            try:
+                # Flush ffmpeg backup if Playwright was primary
+                if _ffmpeg_rec is not None and rec_session is not _ffmpeg_rec:
+                    try:
+                        await stop_ffmpeg_recording(_ffmpeg_rec)
+                    except Exception:
+                        pass
+                if rec_session:
+                    _bot_print(f"[BOT] Crash recovery: attempting to save recording…")
+                    saved_path = await stop_recording(rec_session, page=page)
+                    if saved_path and saved_path.exists():
+                        path_str = str(saved_path.resolve())
+                        _bot_print(f"[BOT] Crash recovery: recording rescued → {path_str}")
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None, _db_save_recording_path_sync, meeting_id, path_str
+                        )
+                        process_meeting_recording.delay(meeting_id, path_str)
+                    else:
+                        _bot_print(f"[BOT] Crash recovery: no recording found to rescue")
+            except Exception as _rescue_err:
+                _bot_print(f"[BOT] Crash recovery failed: {_rescue_err}")
+
             for cleanup in [
-                lambda: stop_recording(rec_session) if rec_session else None,
                 lambda: browser.close() if browser else None,
             ]:
                 try:
@@ -1884,6 +2057,7 @@ async def _run_session(
                     pass
             rec_session = None
             browser = None
+
 
             if attempt < MAX_RETRIES:
                 _bot_print(f"[BOT] Retrying in 5s…")
@@ -1950,15 +2124,19 @@ async def join_google_meet(
 
     if not meeting_id:
         try:
+            # Ensure screenshot dir exists immediately
+            _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            _bot_print(f"Created screenshot directory: {_SCREENSHOT_DIR}")
+
             loop = asyncio.get_event_loop()
             title = f"Google Meet — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
-            _bot_print(f"[BOT] Upserting meeting record in DB")
+            _bot_print(f"Upserting meeting record in DB")
             meeting_id = await loop.run_in_executor(
                 None, _db_upsert_meeting_sync, user_id, organization_id, meet_url, title
             )
-            _bot_print(f"[BOT] Meeting record upserted: {meeting_id}")
+            _bot_print(f"Meeting record upserted: {meeting_id}")
         except Exception as exc:
-            _bot_print(f"[BOT ERROR] Could not upsert meeting record: {exc}")
+            _bot_print(f"ERROR during initialization: {exc}")
             meeting_id = "unknown"
 
     _active_bots[user_id] = {

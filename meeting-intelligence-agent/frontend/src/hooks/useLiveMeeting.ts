@@ -1,13 +1,9 @@
 /**
  * useLiveMeeting — user-aware live meeting hook.
  *
- * Connects to the WebSocket live feed and maintains state for:
- *   • transcript segments
- *   • mentions, action items, decisions
- *   • confirmations (links back to action items via event_id)
- *   • event enrichments (memory links from past meetings)
- *   • toast queue (ephemeral alerts for critical/important events)
- *   • personal filter (show only items relevant to currentUserId)
+ * Events processed:
+ *   transcript, mention, action_item, decision, confirmation,
+ *   event_enrichment, recommendation, interrupt, status, heartbeat
  *
  * Usage:
  *   const live = useLiveMeeting(meetingId, { currentUserId: user.id })
@@ -16,69 +12,77 @@ import { useCallback, useEffect, useReducer, useRef } from 'react'
 import { getAccessToken } from '../lib/auth'
 import { getApiBaseUrl } from '../lib/api'
 
-// ── Event shape definitions ───────────────────────────────────────────────────
+// ── Event shapes ──────────────────────────────────────────────────────────────
 
 export interface RelatedEvent {
-  meeting_id:    string
-  meeting_title: string
-  meeting_date:  string
-  text:          string
-  event_type:    string
+  meeting_id: string; meeting_title: string; meeting_date: string
+  text: string; event_type: string
 }
 
 export interface TranscriptSegment {
-  type: 'transcript'
-  text: string; speaker: string | null; t: number; final: boolean
-  meeting_id: string; ts: string
+  type: 'transcript'; text: string; speaker: string | null
+  t: number; final: boolean; meeting_id: string; ts: string
 }
 
 export interface MentionEvent {
-  type: 'mention'
-  name: string; text: string; t: number
-  meeting_id: string; ts: string
+  type: 'mention'; name: string; text: string; t: number; meeting_id: string; ts: string
 }
 
 export interface ActionItemEvent {
-  type:              'action_item'
-  event_id:          string
-  text:              string
-  assignee:          string | null
-  target_user_id:    string | null
-  priority:          'critical' | 'important' | 'info'
-  confirmed:         boolean
-  confidence:        'high' | 'medium' | 'low'
-  source:            'regex' | 'llm'
+  type: 'action_item'; event_id: string; text: string
+  assignee: string | null; target_user_id: string | null
+  priority: 'critical' | 'important' | 'info'
+  reason: string; explanation: string       // WHY this matters
+  confidence_score: number                   // 0–1 float
+  detection_method: 'regex' | 'llm'
+  urgency_flag: boolean
+  related_context: string
+  confirmed: boolean
   related_to_previous: RelatedEvent | null
-  t:                 number
-  meeting_id:        string; ts: string
+  t: number; meeting_id: string; ts: string
 }
 
 export interface DecisionEvent {
-  type:              'decision'
-  event_id:          string
-  text:              string
-  target_user_id:    string | null
-  priority:          'critical' | 'important' | 'info'
-  confidence:        'high' | 'medium' | 'low'
-  source:            'regex' | 'llm'
+  type: 'decision'; event_id: string; text: string
+  target_user_id: string | null
+  priority: 'critical' | 'important' | 'info'
+  reason: string; explanation: string
+  confidence_score: number
+  detection_method: 'regex' | 'llm'
+  urgency_flag: boolean
+  related_context: string
   related_to_previous: RelatedEvent | null
-  t:                 number
-  meeting_id:        string; ts: string
+  t: number; meeting_id: string; ts: string
 }
 
 export interface ConfirmationEvent {
-  type:            'confirmation'
-  event_id:        string
-  action_event_id: string   // event_id of the confirmed action item
-  action_text:     string
-  t:               number
-  meeting_id:      string; ts: string
+  type: 'confirmation'; event_id: string
+  action_event_id: string; action_text: string; raw: string
+  reason: string; explanation: string
+  confidence_score: number; detection_method: 'regex' | 'llm'
+  urgency_flag: boolean
+  t: number; meeting_id: string; ts: string
+}
+
+export interface RecommendationEvent {
+  type: 'recommendation'
+  action: 'join_now' | 'can_skip' | 'already_handling'
+  reason: string; explanation: string
+  urgency: 'high' | 'medium' | 'low'
+  confidence: number
+  t: number; meeting_id: string; ts: string
+}
+
+export interface InterruptEvent {
+  type: 'interrupt'; event_id: string; action_event_id: string
+  action_text: string; assignee: string | null; target_user_id: string | null
+  reason: string; explanation: string
+  urgency_flag: boolean
+  t: number; meeting_id: string; ts: string
 }
 
 export interface EventEnrichment {
-  type:                'event_enrichment'
-  event_id:            string    // original event to update
-  original_type:       string
+  type: 'event_enrichment'; event_id: string; original_type: string
   related_to_previous: RelatedEvent
 }
 
@@ -86,40 +90,36 @@ export interface StatusEvent  { type: 'status';    status: 'recording' | 'stoppe
 export interface HeartbeatEvent { type: 'heartbeat'; elapsed_s: number }
 
 export interface ToastEntry {
-  id:         string
-  kind:       'action_item' | 'decision' | 'mention' | 'confirmation'
-  text:       string
-  assignee?:  string | null
-  name?:      string
-  priority?:  string
-  source?:    string
-  isForMe:    boolean
-  addedAt:    number
+  id: string
+  kind: 'action_item' | 'decision' | 'mention' | 'confirmation' | 'interrupt' | 'recommendation'
+  text: string; assignee?: string | null; name?: string
+  priority?: string; source?: string; action?: string
+  isForMe: boolean; urgency?: string
+  addedAt: number
 }
 
 type LiveEvent =
   | TranscriptSegment | MentionEvent | ActionItemEvent | DecisionEvent
-  | ConfirmationEvent | EventEnrichment | StatusEvent | HeartbeatEvent
+  | ConfirmationEvent | RecommendationEvent | InterruptEvent
+  | EventEnrichment | StatusEvent | HeartbeatEvent
   | { type: 'ping' } | { type: 'error'; message: string }
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 export interface LiveMeetingState {
-  connected:       boolean
-  pipelineStatus:  'idle' | 'recording' | 'stopped' | 'error'
-  elapsedS:        number
-  segments:        TranscriptSegment[]
-  mentions:        MentionEvent[]
-  actionItems:     ActionItemEvent[]
-  decisions:       DecisionEvent[]
-  toasts:          ToastEntry[]
-  error:           string | null
+  connected: boolean; pipelineStatus: 'idle' | 'recording' | 'stopped' | 'error'
+  elapsedS: number
+  segments: TranscriptSegment[]; mentions: MentionEvent[]
+  actionItems: ActionItemEvent[]; decisions: DecisionEvent[]
+  recommendation: RecommendationEvent | null
+  toasts: ToastEntry[]
+  error: string | null
 }
 
 const INITIAL: LiveMeetingState = {
   connected: false, pipelineStatus: 'idle', elapsedS: 0,
   segments: [], mentions: [], actionItems: [], decisions: [],
-  toasts: [], error: null,
+  recommendation: null, toasts: [], error: null,
 }
 
 // ── Reducer ───────────────────────────────────────────────────────────────────
@@ -138,12 +138,12 @@ type Action =
 let _seq = 0
 const nextId = () => `t${++_seq}`
 
-function shouldToast(ev: ActionItemEvent | DecisionEvent, currentUserId?: string): boolean {
-  if (ev.priority === 'info') return false
-  // Always toast critical; only toast important for things assigned/related to the user
-  if (ev.priority === 'critical') return true
-  if (ev.type === 'action_item' && ev.target_user_id && ev.target_user_id === currentUserId) return true
-  return ev.priority === 'important' && ev.confidence === 'high'
+function _shouldToast(ev: ActionItemEvent | DecisionEvent | RecommendationEvent, currentUserId?: string): boolean {
+  if ('priority' in ev && ev.priority === 'info') return false
+  if (ev.type === 'recommendation') return ev.urgency === 'high' || ev.urgency === 'medium'
+  if ('priority' in ev && ev.priority === 'critical') return true
+  if (ev.type === 'action_item' && 'target_user_id' in ev && ev.target_user_id && ev.target_user_id === currentUserId) return true
+  return false
 }
 
 function reducer(state: LiveMeetingState, action: Action): LiveMeetingState {
@@ -164,68 +164,87 @@ function reducer(state: LiveMeetingState, action: Action): LiveMeetingState {
       switch (ev.type) {
 
         case 'transcript':
-          return { ...state, segments: [...state.segments, ev].slice(-MAX_SEGMENTS) }
+          return { ...state, segments: [...state.segments, ev as TranscriptSegment].slice(-MAX_SEGMENTS) }
 
         case 'mention': {
+          const me = ev as MentionEvent
           const toast: ToastEntry = {
-            id: nextId(), kind: 'mention', text: ev.text, name: ev.name,
+            id: nextId(), kind: 'mention', text: me.text, name: me.name,
             isForMe: false, addedAt: Date.now(),
           }
-          return { ...state, mentions: [...state.mentions, ev], toasts: [...state.toasts, toast] }
+          return { ...state, mentions: [...state.mentions, me], toasts: [...state.toasts, toast] }
         }
 
         case 'action_item': {
-          const isForMe = !!(ev.target_user_id && ev.target_user_id === currentUserId)
-          const newItems = [...state.actionItems, ev]
-          const newToasts = shouldToast(ev, currentUserId)
+          const ai = ev as ActionItemEvent
+          const isForMe = !!(ai.target_user_id && ai.target_user_id === currentUserId)
+          const newToasts = _shouldToast(ai, currentUserId)
             ? [...state.toasts, {
                 id: nextId(), kind: 'action_item' as const,
-                text: ev.text, assignee: ev.assignee,
-                priority: ev.priority, source: ev.source,
+                text: ai.text, assignee: ai.assignee,
+                priority: ai.priority, source: ai.detection_method,
                 isForMe, addedAt: Date.now(),
               }]
             : state.toasts
-          return { ...state, actionItems: newItems, toasts: newToasts }
+          return { ...state, actionItems: [...state.actionItems, ai], toasts: newToasts }
         }
 
         case 'decision': {
-          const newDecs = [...state.decisions, ev]
-          const newToasts = shouldToast(ev, currentUserId)
+          const de = ev as DecisionEvent
+          const newToasts = _shouldToast(de, currentUserId)
             ? [...state.toasts, {
                 id: nextId(), kind: 'decision' as const,
-                text: ev.text, priority: ev.priority, source: ev.source,
+                text: de.text, priority: de.priority, source: de.detection_method,
                 isForMe: false, addedAt: Date.now(),
               }]
             : state.toasts
-          return { ...state, decisions: newDecs, toasts: newToasts }
+          return { ...state, decisions: [...state.decisions, de], toasts: newToasts }
         }
 
         case 'confirmation': {
-          // Mark the linked action item as confirmed
+          const cf = ev as ConfirmationEvent
           const updated = state.actionItems.map(ai =>
-            ai.event_id === ev.action_event_id ? { ...ai, confirmed: true } : ai
+            ai.event_id === cf.action_event_id ? { ...ai, confirmed: true } : ai
           )
           const toast: ToastEntry = {
             id: nextId(), kind: 'confirmation',
-            text: `Confirmed: ${ev.action_text.slice(0, 60)}`,
+            text: `✓ Confirmed: ${cf.action_text.slice(0, 60)}`,
             isForMe: false, addedAt: Date.now(),
           }
           return { ...state, actionItems: updated, toasts: [...state.toasts, toast] }
         }
 
+        case 'recommendation': {
+          const re = ev as RecommendationEvent
+          const toast: ToastEntry = {
+            id: nextId(), kind: 'recommendation',
+            text: re.explanation, action: re.action,
+            priority: re.urgency, source: 'regex',
+            isForMe: true, urgency: re.urgency, addedAt: Date.now(),
+          }
+          return { ...state, recommendation: re, toasts: [...state.toasts, toast] }
+        }
+
+        case 'interrupt': {
+          const ir = ev as InterruptEvent
+          const toast: ToastEntry = {
+            id: nextId(), kind: 'interrupt',
+            text: ir.explanation, assignee: ir.assignee,
+            priority: 'critical', source: 'regex',
+            isForMe: true, urgency: 'high', addedAt: Date.now(),
+          }
+          return { ...state, toasts: [...state.toasts, toast] }
+        }
+
         case 'event_enrichment': {
-          // Merge related_to_previous into the matching event
-          const updatedAI = state.actionItems.map(ai =>
-            ai.event_id === ev.event_id
-              ? { ...ai, related_to_previous: ev.related_to_previous }
-              : ai
+          const ee = ev as EventEnrichment
+          const updAI = state.actionItems.map(ai =>
+            ai.event_id === ee.event_id ? { ...ai, related_to_previous: ee.related_to_previous } : ai
           )
-          const updatedDec = state.decisions.map(d =>
-            d.event_id === ev.event_id
-              ? { ...d, related_to_previous: ev.related_to_previous }
-              : d
+          const updDec = state.decisions.map(d =>
+            d.event_id === ee.event_id ? { ...d, related_to_previous: ee.related_to_previous } : d
           )
-          return { ...state, actionItems: updatedAI, decisions: updatedDec }
+          return { ...state, actionItems: updAI, decisions: updDec }
         }
 
         case 'status': {
@@ -242,8 +261,7 @@ function reducer(state: LiveMeetingState, action: Action): LiveMeetingState {
         case 'error':
           return { ...state, error: (ev as { type: 'error'; message: string }).message }
 
-        default:
-          return state
+        default: return state
       }
     }
     default: return state
@@ -252,9 +270,7 @@ function reducer(state: LiveMeetingState, action: Action): LiveMeetingState {
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
-interface Options {
-  currentUserId?: string
-}
+interface Options { currentUserId?: string }
 
 export function useLiveMeeting(
   meetingId: string | null | undefined,
@@ -262,19 +278,19 @@ export function useLiveMeeting(
 ): LiveMeetingState & { dismissToast: (id: string) => void } {
   const { currentUserId } = options
   const [state, dispatch] = useReducer(reducer, INITIAL)
-  const wsRef             = useRef<WebSocket | null>(null)
+  const wsRef           = useRef<WebSocket | null>(null)
   const reconnectAttempts = useRef(0)
   const reconnectTimer    = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const mounted           = useRef(true)
+  const mounted          = useRef(true)
 
   const connect = useCallback(() => {
     if (!meetingId) return
     const token = getAccessToken()
     if (!token) { dispatch({ type: 'ERROR', message: 'Not authenticated' }); return }
 
-    const base   = getApiBaseUrl() || window.location.origin
-    const url    = `${base.replace(/^http/, 'ws')}/api/v1/live/ws/${meetingId}?token=${encodeURIComponent(token)}`
-    const ws     = new WebSocket(url)
+    const base = getApiBaseUrl() || window.location.origin
+    const url  = `${base.replace(/^http/, 'ws')}/api/v1/live/ws/${meetingId}?token=${encodeURIComponent(token)}`
+    const ws   = new WebSocket(url)
     wsRef.current = ws
 
     ws.onopen = () => {
@@ -287,7 +303,7 @@ export function useLiveMeeting(
       try {
         const event: LiveEvent = JSON.parse(evt.data)
         dispatch({ type: 'EVENT', event, currentUserId })
-      } catch { /* ignore malformed */ }
+      } catch { /* ignore */ }
     }
     ws.onerror = () => {
       if (!mounted.current) return
@@ -303,13 +319,11 @@ export function useLiveMeeting(
     }
   }, [meetingId, currentUserId])
 
-  // Toast expiry interval
   useEffect(() => {
     const id = setInterval(() => dispatch({ type: 'EXPIRE_TOASTS' }), 2_000)
     return () => clearInterval(id)
   }, [])
 
-  // Connect / disconnect
   useEffect(() => {
     mounted.current = true
     if (!meetingId) return
@@ -322,6 +336,5 @@ export function useLiveMeeting(
   }, [meetingId, connect])
 
   const dismissToast = useCallback((id: string) => dispatch({ type: 'DISMISS_TOAST', id }), [])
-
   return { ...state, dismissToast }
 }

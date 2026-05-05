@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, cast, String
 from sqlalchemy.orm import Session
 
 from app.models.action_item import ActionItem
@@ -301,7 +301,7 @@ class PreMeetingBriefService:
                     and_(
                         Meeting.id != getattr(meeting, "id", None),
                         Meeting.scheduled_start < getattr(meeting, "scheduled_start", None),
-                        or_(*[Meeting.attendee_ids.contains([str(aid)]) for aid in _attendee_ids])
+                        or_(*[cast(Meeting.attendee_ids, String).ilike(f"%{aid}%") for aid in _attendee_ids])
                     )
                 ).order_by(Meeting.scheduled_start.desc())
             ).scalar_one_or_none()

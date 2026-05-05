@@ -268,14 +268,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             f"(interval={settings.RETENTION_ENFORCEMENT_INTERVAL_MINUTES} minutes)"
         )
 
-    if settings.MEET_BOT_AUTO_JOIN_ENABLED:
-        auto_join_task = asyncio.create_task(_auto_join_loop())
-        zoom_auto_join_task = asyncio.create_task(_zoom_auto_join_loop())
-        logger.info(
-            f"[AutoJoin] Google Meet + Zoom schedulers enabled "
-            f"(check every {settings.MEET_BOT_LEAD_TIME_MINUTES} minutes, "
-            f"stay {settings.MEET_BOT_STAY_DURATION_SECONDS}s)"
-        )
+    # Bot dispatch is handled exclusively by Celery Beat (poll_db_and_auto_join task).
+    # The asyncio loops below are disabled to prevent duplicate dispatch.
+    # if settings.MEET_BOT_AUTO_JOIN_ENABLED:
+    #     auto_join_task = asyncio.create_task(_auto_join_loop())
+    #     zoom_auto_join_task = asyncio.create_task(_zoom_auto_join_loop())
+    #     logger.info(
+    #         f"[AutoJoin] Google Meet + Zoom schedulers enabled "
+    #         f"(check every {settings.MEET_BOT_LEAD_TIME_MINUTES} minutes, "
+    #         f"stay {settings.MEET_BOT_STAY_DURATION_SECONDS}s)"
+    #     )
 
     # Debug: confirm Google OAuth is configured
     _gid = (settings.GOOGLE_CLIENT_ID or "").strip()

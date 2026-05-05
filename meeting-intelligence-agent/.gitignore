@@ -76,3 +76,6 @@ docker-compose.override.yml
 # Celery
 celerybeat-schedule
 celerybeat.pid
+
+# Debug Screenshots
+backend/debug/

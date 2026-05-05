@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     # bypasses Google's headless browser detection
     xvfb \
     x11-utils \
+    pulseaudio \
     # Chromium runtime dependencies not pulled in by --with-deps on slim
     libnss3 \
     libnspr4 \
